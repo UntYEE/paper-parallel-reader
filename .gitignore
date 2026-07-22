@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.log
+
+# Local paper/source cache and generated index.
+papers_to_translate/
+
+# Generated translations are local by default; keep the bundled example.
+viewer/translations/*.json
+!viewer/translations/attention-is-all-you-need.sample.json
+

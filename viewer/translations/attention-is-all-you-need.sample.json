@@ -1,0 +1,48 @@
+{
+  "title": "Attention Is All You Need",
+  "paperUrl": "https://arxiv.org/pdf/1706.03762",
+  "coverage": "Sample only: abstract and introduction excerpts, not a full-paper translation.",
+  "source": "The left pane loads the authoritative PDF. This JSON stores section/paragraph-level Chinese translation and short anchors only.",
+  "sections": [
+    {
+      "id": "abstract",
+      "title": "Abstract",
+      "pageStart": 1,
+      "pageEnd": 1,
+      "paragraphs": [
+        {
+          "id": "abstract-p1",
+          "page": 1,
+          "anchor": "Abstract, paragraph 1",
+          "translation": "主流的序列转导模型通常基于复杂的循环神经网络或卷积神经网络，并包含编码器和解码器。表现最好的模型还会通过注意力机制连接编码器和解码器。本文提出一种新的简单网络架构 Transformer，它完全基于注意力机制，彻底去掉循环和卷积。在两个机器翻译任务上的实验表明，这类模型质量更高、更容易并行化，并且训练时间显著更少。"
+        }
+      ]
+    },
+    {
+      "id": "introduction",
+      "title": "1 Introduction",
+      "pageStart": 1,
+      "pageEnd": 2,
+      "paragraphs": [
+        {
+          "id": "introduction-p1",
+          "page": 1,
+          "anchor": "Introduction, opening motivation",
+          "translation": "循环神经网络、长短期记忆网络和门控循环网络已经成为序列建模与序列转导任务中的主流方法。典型做法是沿着输入和输出序列的位置逐步计算隐藏状态，这种顺序依赖让训练难以在一个样本内部充分并行，尤其在序列较长时会限制效率。"
+        },
+        {
+          "id": "introduction-p2",
+          "page": 1,
+          "anchor": "Introduction, attention as sequence backbone",
+          "translation": "注意力机制已经被广泛用于建模序列中远距离位置之间的依赖，但过去通常只是作为循环网络旁边的辅助模块。本文把注意力机制提升为模型主干：编码器和解码器都使用自注意力来计算表示，从而减少顺序计算并缩短长距离依赖的信息路径。"
+        },
+        {
+          "id": "introduction-p3",
+          "page": 2,
+          "anchor": "Introduction, contribution summary",
+          "translation": "Transformer 是第一个完全依赖自注意力来计算输入和输出表示的序列转导模型，不再使用序列对齐的循环结构或卷积结构。论文随后在机器翻译任务上证明，这种架构可以取得更好的翻译质量，同时显著提升训练并行度。"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Parallel Reader</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">PR</span>
+        <div>
+          <h1>Paper Parallel Reader</h1>
+          <p id="paper-meta">Original + literal translation</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="compact-toggle" type="button">Compact</button>
+        <button id="theme-toggle" type="button">Dark</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="paper-pane" aria-label="paper original">
+        <form class="toolbar" id="paper-form">
+          <label for="pdf-url">PDF</label>
+          <input id="pdf-url" name="pdf-url" type="url" spellcheck="false" />
+          <button type="submit">Load</button>
+          <label class="file-button" for="pdf-file">Local PDF</label>
+          <input id="pdf-file" type="file" accept="application/pdf" />
+        </form>
+        <iframe id="paper-frame" title="paper pdf"></iframe>
+      </section>
+
+      <section class="translation-pane" aria-label="paper translation">
+        <form class="generator" id="generator-form">
+          <div class="generator-grid">
+            <label>
+              <span>Title</span>
+              <input id="generate-title" type="text" value="Attention Is All You Need" />
+            </label>
+            <label>
+              <span>Output</span>
+              <input id="generate-output" type="text" value="attention-is-all-you-need.json" />
+            </label>
+            <label>
+              <span>Pages</span>
+              <input id="generate-pages" type="text" placeholder="optional, e.g. 1-3" />
+            </label>
+            <label>
+              <span>Parallel</span>
+              <input id="generate-parallelism" type="number" min="1" max="8" value="3" />
+            </label>
+            <label>
+              <span>Source</span>
+              <select id="generate-source-mode">
+                <option value="auto" selected>Auto</option>
+                <option value="latex">LaTeX</option>
+                <option value="pdf">PDF</option>
+              </select>
+            </label>
+            <label>
+              <span>Downloaded PDF</span>
+              <select id="generate-saved-pdf"></select>
+            </label>
+            <label>
+              <span>PDF file</span>
+              <input id="generate-pdf" type="file" accept="application/pdf" />
+            </label>
+          </div>
+          <div class="generator-actions">
+            <button id="generate-button" type="submit">Generate</button>
+            <label class="switch">
+              <input id="generate-dry-run" type="checkbox" />
+              <span>Dry run</span>
+            </label>
+            <label class="switch">
+              <input id="generate-force" type="checkbox" />
+              <span>Force regenerate</span>
+            </label>
+            <span id="generate-status">Backend: unchecked</span>
+          </div>
+        </form>
+
+        <form class="toolbar" id="translation-form">
+          <label for="translation-url">Translation</label>
+          <input id="translation-url" name="translation-url" type="text" spellcheck="false" />
+          <button type="submit">Load</button>
+          <label class="file-button" for="translation-file">JSON</label>
+          <input id="translation-file" type="file" accept="application/json,.json" />
+        </form>
+
+        <div class="translation-tools">
+          <input id="search-box" type="search" placeholder="Search" spellcheck="false" />
+          <label class="switch">
+            <input id="anchor-toggle" type="checkbox" checked />
+            <span>Anchors</span>
+          </label>
+        </div>
+
+        <article id="translation-list" class="translation-list"></article>
+      </section>
+    </main>
+
+    <template id="section-template">
+      <section class="translation-section">
+        <header class="section-head">
+          <div>
+            <span class="section-number"></span>
+            <h2 class="section-title"></h2>
+          </div>
+          <span class="section-pages"></span>
+        </header>
+        <div class="paragraphs"></div>
+      </section>
+    </template>
+
+    <template id="paragraph-template">
+      <section class="paragraph">
+        <div class="paragraph-head">
+          <span class="paragraph-index"></span>
+          <span class="paragraph-page"></span>
+        </div>
+        <p class="paragraph-anchor"></p>
+        <p class="paragraph-translation"></p>
+        <p class="paragraph-note"></p>
+      </section>
+    </template>
+
+    <script src="./app.js" type="module"></script>
+  </body>
+</html>
