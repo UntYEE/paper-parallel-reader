@@ -4,102 +4,139 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Paper Parallel Reader</title>
+    <link rel="stylesheet" href="./vendor/katex/katex.min.css" />
     <link rel="stylesheet" href="./styles.css" />
+    <script defer src="./vendor/katex/katex.min.js"></script>
+    <script defer src="./vendor/katex/contrib/auto-render.min.js"></script>
+    <script defer src="./vendor/marked/marked.umd.js"></script>
+    <script defer src="./vendor/dompurify/purify.min.js"></script>
   </head>
   <body>
     <header class="topbar">
       <div class="brand">
         <span class="brand-mark">PR</span>
-        <div>
+        <div class="brand-copy">
           <h1>Paper Parallel Reader</h1>
           <p id="paper-meta">Original + literal translation</p>
         </div>
       </div>
       <div class="actions">
-        <button id="compact-toggle" type="button">Compact</button>
-        <button id="theme-toggle" type="button">Dark</button>
+        <button id="translation-focus-toggle" class="quiet-button" type="button" aria-pressed="false" title="只显示译文">专注</button>
+        <button id="compact-toggle" class="quiet-button" type="button" aria-pressed="false" title="切换紧凑排版">紧凑</button>
+        <button id="theme-toggle" class="quiet-button" type="button" aria-pressed="false" title="切换深色模式">深色</button>
       </div>
+      <span class="shooting-star shooting-star--lead" aria-hidden="true"></span>
+      <span class="shooting-star shooting-star--upper" aria-hidden="true"></span>
+      <span class="shooting-star shooting-star--lower" aria-hidden="true"></span>
     </header>
 
     <main class="shell">
       <section class="paper-pane" aria-label="paper original">
         <form class="toolbar" id="paper-form">
-          <label for="pdf-url">PDF</label>
-          <input id="pdf-url" name="pdf-url" type="url" spellcheck="false" />
-          <button type="submit">Load</button>
-          <label class="file-button" for="pdf-file">Local PDF</label>
+          <label class="toolbar-label" for="pdf-url">论文</label>
+          <input id="pdf-url" name="pdf-url" type="search" spellcheck="false" autocomplete="off" placeholder="论文标题、关键词、arXiv ID 或 PDF 链接" aria-controls="paper-search-results" />
+          <button class="primary-button" type="submit">检索</button>
+          <label class="file-button" for="pdf-file">上传 PDF</label>
           <input id="pdf-file" type="file" accept="application/pdf" />
+          <div id="paper-search-results" class="paper-search-results" hidden></div>
         </form>
         <iframe id="paper-frame" title="paper pdf"></iframe>
       </section>
 
       <section class="translation-pane" aria-label="paper translation">
-        <form class="generator" id="generator-form">
-          <div class="generator-grid">
-            <label>
-              <span>Title</span>
-              <input id="generate-title" type="text" value="Attention Is All You Need" />
-            </label>
-            <label>
-              <span>Output</span>
-              <input id="generate-output" type="text" value="attention-is-all-you-need.json" />
-            </label>
-            <label>
-              <span>Pages</span>
-              <input id="generate-pages" type="text" placeholder="optional, e.g. 1-3" />
-            </label>
-            <label>
-              <span>Parallel</span>
-              <input id="generate-parallelism" type="number" min="1" max="8" value="3" />
-            </label>
-            <label>
-              <span>Source</span>
-              <select id="generate-source-mode">
-                <option value="auto" selected>Auto</option>
-                <option value="latex">LaTeX</option>
-                <option value="pdf">PDF</option>
-              </select>
-            </label>
-            <label>
-              <span>Downloaded PDF</span>
-              <select id="generate-saved-pdf"></select>
-            </label>
-            <label>
-              <span>PDF file</span>
-              <input id="generate-pdf" type="file" accept="application/pdf" />
-            </label>
-          </div>
-          <div class="generator-actions">
-            <button id="generate-button" type="submit">Generate</button>
-            <label class="switch">
-              <input id="generate-dry-run" type="checkbox" />
-              <span>Dry run</span>
-            </label>
-            <label class="switch">
-              <input id="generate-force" type="checkbox" />
-              <span>Force regenerate</span>
-            </label>
-            <span id="generate-status">Backend: unchecked</span>
-          </div>
-        </form>
+        <details class="generator-panel">
+          <summary>
+            <span class="generator-summary-copy">
+              <strong>生成设置</strong>
+              <small>来源、页码与并行参数</small>
+            </span>
+            <span id="generate-status">正在检查后端</span>
+          </summary>
+          <form class="generator" id="generator-form">
+            <div class="generator-grid">
+              <label>
+                <span>标题</span>
+                <input id="generate-title" type="text" value="Attention Is All You Need" />
+              </label>
+              <label>
+                <span>输出文件</span>
+                <input id="generate-output" type="text" value="attention-is-all-you-need.json" />
+              </label>
+              <label>
+                <span>页码范围</span>
+                <input id="generate-pages" type="text" placeholder="可选，例如 1-3" />
+              </label>
+              <label>
+                <span>并行数</span>
+                <input id="generate-parallelism" type="number" min="1" max="8" value="3" />
+              </label>
+              <label>
+                <span>解析来源</span>
+                <select id="generate-source-mode">
+                  <option value="auto" selected>自动选择</option>
+                  <option value="latex">LaTeX</option>
+                  <option value="pdf">PDF</option>
+                </select>
+              </label>
+              <label>
+                <span>已下载论文</span>
+                <select id="generate-saved-pdf"></select>
+              </label>
+              <label>
+                <span>本地 PDF</span>
+                <input id="generate-pdf" type="file" accept="application/pdf" />
+              </label>
+            </div>
+            <div class="generator-actions">
+              <button id="generate-button" class="primary-button" type="submit">生成译文</button>
+              <label class="switch">
+                <input id="generate-dry-run" type="checkbox" />
+                <span>仅预览</span>
+              </label>
+              <label class="switch">
+                <input id="generate-force" type="checkbox" />
+                <span>强制重新生成</span>
+              </label>
+            </div>
+          </form>
+        </details>
 
         <form class="toolbar" id="translation-form">
-          <label for="translation-url">Translation</label>
+          <label class="toolbar-label" for="translation-url">译文</label>
           <input id="translation-url" name="translation-url" type="text" spellcheck="false" />
-          <button type="submit">Load</button>
-          <label class="file-button" for="translation-file">JSON</label>
+          <button type="submit">载入</button>
+          <label class="file-button" for="translation-file">上传 JSON</label>
           <input id="translation-file" type="file" accept="application/json,.json" />
         </form>
 
         <div class="translation-tools">
-          <input id="search-box" type="search" placeholder="Search" spellcheck="false" />
+          <input id="search-box" type="search" placeholder="在译文中搜索" spellcheck="false" />
           <label class="switch">
             <input id="anchor-toggle" type="checkbox" checked />
-            <span>Anchors</span>
+            <span>显示定位</span>
           </label>
         </div>
 
         <article id="translation-list" class="translation-list"></article>
+
+        <button id="chat-toggle" class="chat-toggle" type="button" title="论文问答" aria-label="打开论文问答" aria-expanded="false"><span>问答</span></button>
+        <aside id="chat-drawer" class="chat-drawer" aria-label="论文问答" hidden>
+          <header class="chat-head">
+            <div>
+              <strong>论文问答</strong>
+              <span id="chat-status">等待论文译文</span>
+            </div>
+            <button id="chat-clear" class="chat-icon-button" type="button" title="清空对话" aria-label="清空对话">清空</button>
+            <button id="chat-close" class="chat-icon-button" type="button" title="关闭" aria-label="关闭论文问答">关闭</button>
+          </header>
+          <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+          <div id="chat-context" class="chat-context" hidden></div>
+          <form id="chat-form" class="chat-form">
+            <textarea id="chat-question" rows="3" maxlength="6000" placeholder="询问这篇论文…"></textarea>
+            <button id="chat-send" class="primary-button" type="submit">发送</button>
+          </form>
+        </aside>
+        <div id="reference-popover" class="reference-popover" hidden></div>
       </section>
     </main>
 
@@ -120,10 +157,13 @@
       <section class="paragraph">
         <div class="paragraph-head">
           <span class="paragraph-index"></span>
-          <span class="paragraph-page"></span>
+          <div class="paragraph-actions">
+            <button class="ask-paragraph" type="button" title="针对本段提问">提问</button>
+            <span class="paragraph-page"></span>
+          </div>
         </div>
         <p class="paragraph-anchor"></p>
-        <p class="paragraph-translation"></p>
+        <div class="paragraph-translation"></div>
         <p class="paragraph-note"></p>
       </section>
     </template>

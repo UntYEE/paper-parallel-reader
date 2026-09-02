@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import os
 import re
 import subprocess
 import tempfile
+import threading
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -16,10 +20,19 @@ from urllib.parse import unquote, urlparse
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
-from scripts.generate_translation_json import generate_translation_json
+from backend.paper_qa import (
+    answer_question,
+    clear_history,
+    get_history,
+    index_status,
+    index_translation,
+)
+from backend.paper_search import discover_papers
+from scripts.generate_translation_json import create_deepseek_client, generate_translation_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +40,7 @@ DEFAULT_OUTPUT_DIR = REPO_ROOT / "viewer" / "translations"
 PAPERS_DIR = REPO_ROOT / "papers_to_translate"
 SOURCES_DIR = PAPERS_DIR / "latex_sources"
 INDEX_PATH = PAPERS_DIR / "paper_index.json"
+QA_DB_PATH = PAPERS_DIR / "paper_qa.sqlite3"
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 SOURCES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -158,6 +172,20 @@ def save_index(index: dict[str, object]) -> None:
     INDEX_PATH.write_text(json_dumps(index), encoding="utf-8")
 
 
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(delete=False, dir=path.parent, prefix=f".{path.name}.", suffix=".part")
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
 def upsert_paper_index(paper_id: str, **fields: object) -> dict[str, object]:
     index = load_index()
     papers = index.setdefault("papers", {})
@@ -186,6 +214,67 @@ def indexed_translation_path(paper_id: str) -> Optional[Path]:
     if path.parent != DEFAULT_OUTPUT_DIR.resolve():
         return None
     return path if path.exists() else None
+
+
+def ensure_qa_index(paper_id: str) -> tuple[Path, dict[str, object]]:
+    translation_path = indexed_translation_path(paper_id)
+    if not translation_path:
+        raise HTTPException(status_code=404, detail="No generated translation is indexed for this paper.")
+    status = index_translation(QA_DB_PATH, paper_id, translation_path)
+    if not status.get("ready"):
+        raise HTTPException(status_code=400, detail="The translation contains no readable paragraphs to index.")
+    return translation_path, status
+
+
+class PaperChatRequest(BaseModel):
+    sessionId: str = Field(min_length=1, max_length=120)
+    question: str = Field(min_length=1, max_length=6000)
+    selectedParagraphId: Optional[str] = Field(default=None, max_length=240)
+    historyLimit: int = Field(default=8, ge=0, le=20)
+
+
+class PaperSearchRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=300)
+    limit: int = Field(default=6, ge=1, le=10)
+
+
+class GenerationTaskRequest(BaseModel):
+    savedPdf: str = Field(min_length=1, max_length=240)
+    title: str = Field(min_length=1, max_length=500)
+    paperUrl: str = Field(default="", max_length=2000)
+    outputName: str = Field(min_length=1, max_length=240)
+    pages: Optional[str] = Field(default=None, max_length=200)
+    coverage: str = Field(default="Full paper text extracted from the provided input.", max_length=1000)
+    model: Optional[str] = Field(default=None, max_length=120)
+    maxChars: int = Field(default=4000, ge=800, le=20000)
+    parallelism: int = Field(default_factory=lambda: env_int("DEEPSEEK_PARALLELISM", 3), ge=1, le=8)
+    retries: int = Field(default=2, ge=0, le=5)
+    pdfExtractor: str = Field(default_factory=lambda: os.getenv("PDF_TEXT_EXTRACTOR", "auto"))
+    sourceMode: str = Field(default_factory=lambda: os.getenv("PAPER_SOURCE_MODE", "auto"))
+    force: bool = False
+
+
+GENERATION_TASKS: dict[str, dict[str, object]] = {}
+GENERATION_TASKS_LOCK = threading.Lock()
+GENERATION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="paper-generation")
+
+
+def update_generation_task(task_id: str, **fields: object) -> None:
+    with GENERATION_TASKS_LOCK:
+        task = GENERATION_TASKS.get(task_id)
+        if not task:
+            return
+        task.update(fields)
+        task["revision"] = int(task.get("revision", 0)) + 1
+        task["updatedAt"] = datetime.now(timezone.utc).isoformat()
+
+
+def public_generation_task(task_id: str) -> dict[str, object]:
+    with GENERATION_TASKS_LOCK:
+        task = GENERATION_TASKS.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Generation task not found.")
+        return dict(task)
 
 
 def safe_pdf_name(value: str) -> str:
@@ -257,7 +346,12 @@ def infer_title_from_pdf(path: Path) -> str:
     affiliation_re = re.compile(r"^(https?://|fair\b|meta\b|google\b|university\b|department\b)", re.IGNORECASE)
     stop_re = re.compile(r"^(abstract|keywords|index terms)\b", re.IGNORECASE)
 
-    for line in lines[:40]:
+    candidate_lines = lines[:40]
+    email_re = re.compile(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b")
+    institution_re = re.compile(r"\b(UC|university|institute|college|laboratory|lab|research)\b", re.IGNORECASE)
+    person_name_re = re.compile(r"^(?:[A-Z][A-Za-z'.-]+\s+){1,4}[A-Z][A-Za-z'.-]+$")
+
+    for index, line in enumerate(candidate_lines):
         if stop_re.match(line):
             break
         if title_lines and affiliation_re.match(line):
@@ -265,6 +359,11 @@ def infer_title_from_pdf(path: Path) -> str:
         if noise_re.match(line):
             continue
         if title_lines and authorish_re.search(line):
+            break
+        next_lines = candidate_lines[index + 1:index + 3]
+        if title_lines and person_name_re.match(line) and any(
+            email_re.search(next_line) or institution_re.search(next_line) for next_line in next_lines
+        ):
             break
         if len(line) < 4:
             continue
@@ -363,6 +462,12 @@ def json_dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
 
 
+def json_event_dumps(value: object) -> str:
+    import json
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def json_loads(value: str) -> dict[str, str]:
     import json
 
@@ -429,6 +534,21 @@ def list_papers() -> dict[str, object]:
     return {"ok": True, "papers": papers}
 
 
+@app.post("/api/search-papers")
+async def search_papers(request: PaperSearchRequest) -> JSONResponse:
+    index = load_index()
+    records = index.get("papers", {})
+    cached_records = list(records.values()) if isinstance(records, dict) else []
+    result = await run_in_threadpool(
+        discover_papers,
+        request.query.strip(),
+        cached_records,
+        request.limit,
+        deepseek_api_key(),
+    )
+    return JSONResponse({"ok": True, "query": request.query.strip(), **result})
+
+
 @app.get("/api/papers/{filename}")
 def serve_paper(filename: str) -> FileResponse:
     path = paper_path(filename)
@@ -478,7 +598,7 @@ def download_pdf_bytes(url: str) -> bytes:
         "--silent",
         "--show-error",
         "--retry",
-        "1",
+        "2",
         "--retry-all-errors",
         "--retry-delay",
         "2",
@@ -518,7 +638,7 @@ def download_binary_bytes(url: str, *, accept: str, max_time: str = "75") -> byt
         "--silent",
         "--show-error",
         "--retry",
-        "1",
+        "2",
         "--retry-all-errors",
         "--retry-delay",
         "2",
@@ -567,7 +687,7 @@ def ensure_arxiv_latex_source(arxiv_id: str) -> Path:
     if data.startswith(b"%PDF"):
         raise RuntimeError("arXiv returned a PDF instead of LaTeX source.")
 
-    path.write_bytes(data)
+    atomic_write_bytes(path, data)
     return path
 
 
@@ -588,9 +708,147 @@ def download_paper(url: Annotated[str, Form()]) -> JSONResponse:
     if not data.startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="Downloaded content does not look like a PDF.")
 
-    path.write_bytes(data)
+    atomic_write_bytes(path, data)
     write_paper_meta(path, url)
     return JSONResponse(paper_payload(path, url, cached=False))
+
+
+def run_generation_task(task_id: str, request: GenerationTaskRequest) -> None:
+    update_generation_task(task_id, status="running")
+    try:
+        pdf_path = paper_path(request.savedPdf)
+        if not pdf_path.exists():
+            raise RuntimeError("Saved PDF not found.")
+        if request.pdfExtractor not in {"auto", "pymupdf", "pypdf"}:
+            raise RuntimeError("pdfExtractor must be auto, pymupdf, or pypdf.")
+        if request.sourceMode not in {"auto", "latex", "pdf"}:
+            raise RuntimeError("sourceMode must be auto, latex, or pdf.")
+
+        meta = read_paper_meta(pdf_path)
+        paper_id = meta.get("paperId") or paper_id_from_url(request.paperUrl) or paper_id_from_filename(pdf_path.name)
+        paper_id = str(paper_id)
+        local_pdf_url = paper_viewer_url(pdf_path.name)
+        latex_path: Optional[Path] = None
+        if request.sourceMode in {"auto", "latex"}:
+            arxiv_id = arxiv_id_from_paper_id(paper_id)
+            if arxiv_id:
+                try:
+                    latex_path = ensure_arxiv_latex_source(arxiv_id)
+                except Exception:
+                    if request.sourceMode == "latex":
+                        raise
+            elif request.sourceMode == "latex":
+                raise RuntimeError("LaTeX source mode is only automatic for arXiv PDFs.")
+
+        output_path = DEFAULT_OUTPUT_DIR / safe_output_name(request.outputName)
+
+        def report(progress: dict[str, object]) -> None:
+            update_generation_task(task_id, progress=progress)
+
+        result = generate_translation_json(
+            pdf=pdf_path if request.sourceMode != "latex" else None,
+            text=None,
+            latex=latex_path if request.sourceMode != "pdf" else None,
+            title=request.title,
+            paper_url=local_pdf_url,
+            output=output_path,
+            model=request.model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+            pages=request.pages,
+            coverage=request.coverage,
+            max_chars=request.maxChars,
+            parallelism=request.parallelism,
+            retries=request.retries,
+            dry_run=False,
+            pdf_extractor=request.pdfExtractor,
+            progress_callback=report,
+            resume=not request.force,
+        )
+        result["paperId"] = paper_id
+        output_path.write_text(json_dumps(result), encoding="utf-8")
+        paragraph_count = sum(len(section["paragraphs"]) for section in result["sections"])
+        upsert_paper_index(
+            paper_id,
+            pdfName=pdf_path.name,
+            sourceUrl=request.paperUrl,
+            pdfPath=str(pdf_path.relative_to(REPO_ROOT)),
+            translationPath=str(output_path.relative_to(REPO_ROOT)),
+            translationName=output_path.name,
+            sourcePath=str(latex_path.relative_to(REPO_ROOT)) if latex_path else "",
+            sourceMode=result.get("extractionMethod", "latex" if latex_path else "pdf"),
+            sections=len(result["sections"]),
+            paragraphs=paragraph_count,
+        )
+        try:
+            index_translation(QA_DB_PATH, paper_id, output_path)
+        except Exception as error:  # noqa: BLE001 - generation remains successful.
+            print(f"QA indexing failed for {paper_id}: {error}", flush=True)
+        update_generation_task(
+            task_id,
+            status="completed",
+            progress=result.get("translationProgress", {}),
+            result={
+                "paperId": paper_id,
+                "output": str(output_path.relative_to(REPO_ROOT)),
+                "pdfUrl": local_pdf_url,
+                "sections": len(result["sections"]),
+                "paragraphs": paragraph_count,
+            },
+        )
+    except Exception as error:  # noqa: BLE001 - task errors are reported through status.
+        current = public_generation_task(task_id)
+        progress = dict(current.get("progress", {})) if isinstance(current.get("progress"), dict) else {}
+        progress["status"] = "failed"
+        update_generation_task(task_id, status="failed", progress=progress, error=str(error))
+
+
+@app.post("/api/generation-tasks", status_code=202)
+def create_generation_task(request: GenerationTaskRequest) -> dict[str, object]:
+    if not deepseek_api_key():
+        raise HTTPException(status_code=400, detail="Set DEEPSEEK_API_KEY before generating.")
+    task_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    with GENERATION_TASKS_LOCK:
+        GENERATION_TASKS[task_id] = {
+            "taskId": task_id,
+            "status": "queued",
+            "revision": 0,
+            "createdAt": now,
+            "updatedAt": now,
+            "progress": {
+                "status": "queued",
+                "completedBatches": 0,
+                "totalBatches": 0,
+                "retryCount": 0,
+                "totalTokens": 0,
+                "estimatedCostUsd": 0,
+            },
+        }
+    GENERATION_EXECUTOR.submit(run_generation_task, task_id, request)
+    return public_generation_task(task_id)
+
+
+@app.get("/api/generation-tasks/{task_id}")
+def get_generation_task(task_id: str) -> dict[str, object]:
+    return public_generation_task(task_id)
+
+
+@app.get("/api/generation-tasks/{task_id}/events")
+async def generation_task_events(task_id: str) -> StreamingResponse:
+    public_generation_task(task_id)
+
+    async def stream():
+        revision = -1
+        while True:
+            task = public_generation_task(task_id)
+            current_revision = int(task.get("revision", 0))
+            if current_revision != revision:
+                revision = current_revision
+                yield f"data: {json_event_dumps(task)}\n\n"
+            if task.get("status") in {"completed", "failed"}:
+                break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/api/generate")
@@ -601,7 +859,7 @@ async def generate(
     pages: Annotated[Optional[str], Form()] = None,
     coverage: Annotated[str, Form()] = "Full paper text extracted from the provided input.",
     model: Annotated[Optional[str], Form()] = None,
-    max_chars: Annotated[int, Form()] = 12000,
+    max_chars: Annotated[int, Form()] = 4000,
     parallelism: Annotated[int, Form()] = env_int("DEEPSEEK_PARALLELISM", 3),
     pdf_extractor: Annotated[str, Form()] = os.getenv("PDF_TEXT_EXTRACTOR", "auto"),
     source_mode: Annotated[str, Form()] = os.getenv("PAPER_SOURCE_MODE", "auto"),
@@ -726,9 +984,9 @@ async def generate(
         try:
             result = await run_in_threadpool(
                 generate_translation_json,
-                pdf=None if latex_path else pdf_path,
+                pdf=pdf_path if source_mode != "latex" else None,
                 text=text_path,
-                latex=latex_path,
+                latex=latex_path if source_mode != "pdf" else None,
                 title=title,
                 paper_url=local_pdf_url,
                 output=output_path,
@@ -740,10 +998,14 @@ async def generate(
                 retries=retries,
                 dry_run=dry_run,
                 pdf_extractor=pdf_extractor,
+                resume=not force,
             )
         except Exception as error:  # noqa: BLE001 - surface extraction/API errors to the UI.
             raise HTTPException(status_code=400, detail=str(error)) from error
+        result["paperId"] = paper_id
+        output_path.write_text(json_dumps(result), encoding="utf-8")
         paragraph_count = sum(len(section["paragraphs"]) for section in result["sections"])
+        status_counts = result.get("statusCounts", {})
         print(
             f"Generated {output_path.relative_to(REPO_ROOT)} "
             f"({len(result['sections'])} sections, {paragraph_count} paragraphs)",
@@ -758,10 +1020,14 @@ async def generate(
                 translationPath=str(output_path.relative_to(REPO_ROOT)),
                 translationName=output_path.name,
                 sourcePath=str(latex_path.relative_to(REPO_ROOT)) if latex_path else "",
-                sourceMode="latex" if latex_path else "pdf",
+                sourceMode=result.get("extractionMethod", "latex" if latex_path else "pdf"),
                 sections=len(result["sections"]),
                 paragraphs=paragraph_count,
             )
+            try:
+                await run_in_threadpool(index_translation, QA_DB_PATH, paper_id, output_path)
+            except Exception as error:  # noqa: BLE001 - translation remains usable if QA indexing fails.
+                print(f"QA indexing failed for {paper_id}: {error}", flush=True)
         return JSONResponse(
             {
                 "ok": True,
@@ -774,6 +1040,8 @@ async def generate(
                 "viewer_url": f"/viewer/?pdf={local_pdf_url}&translation=./translations/{output_path.name}",
                 "sections": len(result["sections"]),
                 "paragraphs": paragraph_count,
+                "status_counts": status_counts,
+                "extraction_method": result.get("extractionMethod", ""),
             }
         )
     finally:
@@ -782,6 +1050,50 @@ async def generate(
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+@app.get("/api/papers/{paper_id}/qa-status")
+def paper_qa_status(paper_id: str) -> dict[str, object]:
+    translation_path = indexed_translation_path(paper_id)
+    if not translation_path:
+        raise HTTPException(status_code=404, detail="No generated translation is indexed for this paper.")
+    status = index_status(QA_DB_PATH, paper_id, translation_path)
+    return {"ok": True, "paperId": paper_id, **status}
+
+
+@app.post("/api/papers/{paper_id}/chat")
+async def paper_chat(paper_id: str, request: PaperChatRequest) -> JSONResponse:
+    if not deepseek_api_key():
+        raise HTTPException(status_code=400, detail="Set DEEPSEEK_API_KEY before asking questions.")
+    _translation_path, status = await run_in_threadpool(ensure_qa_index, paper_id)
+    try:
+        answer = await run_in_threadpool(
+            answer_question,
+            QA_DB_PATH,
+            paper_id,
+            request.sessionId,
+            request.question.strip(),
+            create_deepseek_client(),
+            os.getenv("QA_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")),
+            request.selectedParagraphId,
+            request.historyLimit,
+            env_int("QA_EVIDENCE_LIMIT", 6),
+        )
+    except Exception as error:  # noqa: BLE001 - expose a useful local API error.
+        raise HTTPException(status_code=400, detail=f"Paper question failed: {error}") from error
+    return JSONResponse({"ok": True, "paperId": paper_id, "index": status, **answer})
+
+
+@app.get("/api/papers/{paper_id}/chat/{session_id}")
+def paper_chat_history(paper_id: str, session_id: str) -> dict[str, object]:
+    ensure_qa_index(paper_id)
+    return {"ok": True, "paperId": paper_id, "messages": get_history(QA_DB_PATH, paper_id, session_id)}
+
+
+@app.delete("/api/papers/{paper_id}/chat/{session_id}")
+def delete_paper_chat_history(paper_id: str, session_id: str) -> dict[str, object]:
+    clear_history(QA_DB_PATH, paper_id, session_id)
+    return {"ok": True, "paperId": paper_id}
 
 
 if __name__ == "__main__":

@@ -4,19 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import gzip
+import hashlib
 import json
 import os
 import re
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
+from urllib.parse import quote
 
 from openai import OpenAI
 from pypdf import PdfReader
@@ -38,7 +43,8 @@ PAGE_HEADER_RE = re.compile(r"^[A-Z][A-Za-z0-9 ,:;'-]{20,}\s+\d+$")
 CAPTION_RE = re.compile(r"^(figure|table)\s+\d+\s*[:.]", re.IGNORECASE)
 INLINE_CAPTION_RE = re.compile(r"(figure|table)\s+\d+\s*[:.]", re.IGNORECASE)
 STOP_SECTION_RE = re.compile(
-    r"^(references|bibliography|acknowledg(?:e)?ments?|appendix)\b",
+    r"^(?:[1-9][0-9]?(?:\.[0-9]+)*\.?\s+)?"
+    r"(references|bibliography|acknowledg(?:e)?ments?|appendix)\b",
     re.IGNORECASE,
 )
 PAGE_TITLE_RE = re.compile(r"^.+\s+\d+\s+I\d+\s*[·.]\s*T\d+", re.IGNORECASE)
@@ -59,6 +65,29 @@ TABLE_DENSE_RE = re.compile(
     re.IGNORECASE,
 )
 PDF_EXTRACTOR = Literal["auto", "pymupdf", "pypdf"]
+TRANSLATION_STATUSES = {"translated", "skipped", "needs_ocr", "needs_formula_recovery"}
+MATH_TOKEN_RE = re.compile(r"@@MATH_[0-9]{4,}@@")
+REFERENCE_TOKEN_RE = re.compile(r"@@(?:XREF|CITE)_[0-9]{4,}@@")
+LITERAL_TOKEN_RE = re.compile(r"@@LITERAL_[0-9]{4,}@@")
+LABEL_TOKEN_RE = re.compile(r"@@LABEL_[0-9]{4,}@@")
+PROTECTED_TOKEN_RE = re.compile(r"@@(?:MATH|XREF|CITE|LITERAL)_[0-9]{4,}@@")
+REFERENCE_COMMAND_RE = re.compile(
+    r"\\(?P<command>cite|citet|citep|citealp|citeauthor|citeyear|ref|eqref|autoref|cref|Cref)"
+    r"\*?(?:\[[^\]]*\]){0,2}\{(?P<keys>[^{}]+)\}"
+)
+MATH_ENVIRONMENTS = (
+    "equation",
+    "equation*",
+    "align",
+    "align*",
+    "alignat",
+    "alignat*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+    "displaymath",
+)
 SKIP_LATEX_ENVS = {
     "figure",
     "figure*",
@@ -66,14 +95,6 @@ SKIP_LATEX_ENVS = {
     "table*",
     "tikzpicture",
     "axis",
-    "equation",
-    "equation*",
-    "align",
-    "align*",
-    "gather",
-    "gather*",
-    "multline",
-    "multline*",
     "algorithm",
     "algorithm*",
     "algorithmic",
@@ -91,6 +112,7 @@ class Paragraph:
     page: int
     anchor: str
     source: str
+    status: str = ""
     translation: str = ""
     note: str = ""
 
@@ -102,6 +124,155 @@ class Section:
     page_start: int
     page_end: int
     paragraphs: list[Paragraph] = field(default_factory=list)
+
+
+class ProtectedTokenError(ValueError):
+    """Raised when one translated paragraph changes immutable tokens."""
+
+    def __init__(self, message: str, item_id: str = "") -> None:
+        super().__init__(message)
+        self.item_id = item_id
+
+
+class FormulaTokenError(ProtectedTokenError):
+    """Raised when a translated paragraph drops or duplicates protected formulas."""
+
+
+class ReferenceTokenError(ProtectedTokenError):
+    """Raised when a translated paragraph drops or duplicates protected references."""
+
+
+class EmptyTranslationResponseError(RuntimeError):
+    """Raised when DeepSeek returns no visible JSON content."""
+
+
+class NonRetryableTranslationError(RuntimeError):
+    """Raised for API failures that cannot succeed without external action."""
+
+
+ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+@dataclass
+class TranslationRun:
+    """Shared API client, counters, and checkpoint state for one paper run."""
+
+    client: OpenAI
+    fingerprint: str
+    checkpoint_path: Path | None = None
+    progress_callback: ProgressCallback | None = None
+    completed_batches: int = 0
+    total_batches: int = 0
+    retries: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cached_prompt_tokens: int = 0
+    checkpoint_batches: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.checkpoint_path and self.checkpoint_path.exists():
+            try:
+                data = json.loads(self.checkpoint_path.read_text(encoding="utf-8"))
+                if data.get("fingerprint") == self.fingerprint and isinstance(data.get("batches"), dict):
+                    self.checkpoint_batches = data["batches"]
+                    self.prompt_tokens = int(data.get("promptTokens", 0))
+                    self.completion_tokens = int(data.get("completionTokens", 0))
+                    self.cached_prompt_tokens = int(data.get("cachedPromptTokens", 0))
+                    self.retries = int(data.get("retries", 0))
+            except (OSError, ValueError, TypeError):
+                self.checkpoint_batches = {}
+
+    def snapshot(self, status: str = "running") -> dict[str, Any]:
+        input_price = float(os.getenv("DEEPSEEK_INPUT_PRICE_USD_PER_MILLION", "0.44"))
+        cached_price = float(os.getenv("DEEPSEEK_CACHED_INPUT_PRICE_USD_PER_MILLION", "0.014"))
+        output_price = float(os.getenv("DEEPSEEK_OUTPUT_PRICE_USD_PER_MILLION", "1.32"))
+        uncached = max(0, self.prompt_tokens - self.cached_prompt_tokens)
+        estimated_cost = (
+            uncached * input_price + self.cached_prompt_tokens * cached_price + self.completion_tokens * output_price
+        ) / 1_000_000
+        return {
+            "status": status,
+            "completedBatches": self.completed_batches,
+            "totalBatches": self.total_batches,
+            "retryCount": self.retries,
+            "promptTokens": self.prompt_tokens,
+            "completionTokens": self.completion_tokens,
+            "totalTokens": self.prompt_tokens + self.completion_tokens,
+            "cachedPromptTokens": self.cached_prompt_tokens,
+            "estimatedCostUsd": round(estimated_cost, 6),
+        }
+
+    def emit(self, status: str = "running") -> None:
+        if self.progress_callback:
+            self.progress_callback(self.snapshot(status))
+
+    def record_response(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        details = getattr(usage, "prompt_tokens_details", None)
+        with self._lock:
+            self.prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+            self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+            self.cached_prompt_tokens += int(getattr(details, "cached_tokens", 0) or 0)
+        self.emit()
+
+    def record_retry(self) -> None:
+        with self._lock:
+            self.retries += 1
+        self.emit()
+
+    def cached(self, batch_id: str) -> dict[str, dict[str, str]] | None:
+        value = self.checkpoint_batches.get(batch_id)
+        return copy.deepcopy(value) if value else None
+
+    def complete(self, batch_id: str, translations: dict[str, dict[str, str]]) -> None:
+        with self._lock:
+            self.checkpoint_batches[batch_id] = copy.deepcopy(translations)
+            self.completed_batches += 1
+            self._write_checkpoint_locked()
+        self.emit()
+
+    def _write_checkpoint_locked(self) -> None:
+        if not self.checkpoint_path:
+            return
+        self.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "fingerprint": self.fingerprint,
+            "batches": self.checkpoint_batches,
+            "promptTokens": self.prompt_tokens,
+            "completionTokens": self.completion_tokens,
+            "cachedPromptTokens": self.cached_prompt_tokens,
+            "retries": self.retries,
+        }
+        handle = tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=self.checkpoint_path.parent,
+            prefix=f".{self.checkpoint_path.name}.",
+            suffix=".part",
+            mode="w",
+            encoding="utf-8",
+        )
+        temp_path = Path(handle.name)
+        try:
+            with handle:
+                json.dump(payload, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temp_path.replace(self.checkpoint_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+
+@dataclass
+class ReferenceBundle:
+    references: dict[str, dict[str, Any]] = field(default_factory=dict)
+    labels: dict[str, dict[str, Any]] = field(default_factory=dict)
+    citations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    label_tokens: dict[str, str] = field(default_factory=dict)
+    assets: list[dict[str, Any]] = field(default_factory=list)
+    literals: dict[str, str] = field(default_factory=dict)
 
 
 def slugify(value: str) -> str:
@@ -262,6 +433,129 @@ def extract_pdf_pages(path: Path, page_range: str | None, extractor: PDF_EXTRACT
     return min(candidates, key=lambda item: item[0])[1]
 
 
+def low_quality_page_numbers(pages: list[tuple[int, str]]) -> set[int]:
+    low_quality: set[int] = set()
+    for page, text in pages:
+        compact = re.sub(r"\s+", "", text)
+        readable = sum(1 for char in compact if char.isalnum())
+        replacement_chars = text.count("\ufffd") + text.count("\x00")
+        if readable < 120 or (compact and replacement_chars / len(compact) > 0.02):
+            low_quality.add(page)
+    return low_quality
+
+
+def extract_pdf_pages_docling(
+    path: Path,
+    page_range: str | None,
+    *,
+    force_ocr: bool,
+    enrich_formulas: bool = False,
+) -> list[tuple[int, str]]:
+    try:
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import OcrAutoOptions, PdfPipelineOptions
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+    except Exception as error:  # noqa: BLE001 - Docling is an optional fallback.
+        raise RuntimeError("Docling is not installed. Install project requirements with Python 3.10+.") from error
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = force_ocr
+    pipeline_options.do_table_structure = False
+    pipeline_options.do_formula_enrichment = enrich_formulas
+    pipeline_options.document_timeout = float(os.getenv("DOCLING_TIMEOUT", "180"))
+    if force_ocr:
+        pipeline_options.ocr_options = OcrAutoOptions(
+            lang=[os.getenv("DOCLING_OCR_LANGUAGE", "en")],
+            force_full_page_ocr=True,
+        )
+
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
+    total_pages = max(1, len(PdfReader(str(path)).pages))
+    wanted_pages = parse_page_range(page_range, total_pages)
+    page_items: dict[int, list[str]] = {}
+    included_labels = {
+        "text",
+        "paragraph",
+        "section_header",
+        "list_item",
+        "formula",
+        "code",
+    }
+
+    selected_pages = wanted_pages or set(range(1, total_pages + 1))
+
+    page_spans: list[tuple[int, int]] = []
+    for page in sorted(selected_pages):
+        if not page_spans or page != page_spans[-1][1] + 1:
+            page_spans.append((page, page))
+        else:
+            page_spans[-1] = (page_spans[-1][0], page)
+
+    for page_span in page_spans:
+        result = converter.convert(path, page_range=page_span)
+        for item, _level in result.document.iterate_items():
+            text = str(getattr(item, "text", "") or "").strip()
+            label = getattr(getattr(item, "label", None), "value", str(getattr(item, "label", "")))
+            if not text or label not in included_labels:
+                continue
+            if label == "formula" and enrich_formulas and not text.startswith(("$", r"\[", r"\(")):
+                text = f"$$\n{text}\n$$"
+            provenance = getattr(item, "prov", None) or []
+            if not provenance:
+                continue
+            page = int(provenance[0].page_no)
+            if page not in selected_pages:
+                continue
+            page_items.setdefault(page, []).append(text)
+
+    return [(page, "\n\n".join(page_items.get(page, []))) for page in sorted(selected_pages)]
+
+
+def extract_pdf_pages_adaptive(
+    path: Path,
+    page_range: str | None,
+    extractor: PDF_EXTRACTOR = "auto",
+) -> tuple[list[tuple[int, str]], set[int]]:
+    pages = extract_pdf_pages(path, page_range, extractor)
+    low_quality = low_quality_page_numbers(pages)
+    if not low_quality:
+        return pages, set()
+
+    requested = ",".join(str(page) for page in sorted(low_quality))
+    try:
+        print(
+            f"Native PDF text is weak on pages {requested}; running Docling OCR fallback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        ocr_pages = dict(
+            extract_pdf_pages_docling(
+                path,
+                requested,
+                force_ocr=True,
+                enrich_formulas=True,
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - native extraction remains usable.
+        print(f"Docling OCR fallback unavailable: {error}", file=sys.stderr, flush=True)
+        return pages, set()
+
+    merged: list[tuple[int, str]] = []
+    replaced: set[int] = set()
+    for page, text in pages:
+        ocr_text = ocr_pages.get(page, "").strip()
+        native_readable = sum(char.isalnum() for char in text)
+        ocr_readable = sum(char.isalnum() for char in ocr_text)
+        if page in low_quality and ocr_readable >= max(120, native_readable):
+            merged.append((page, ocr_text))
+            replaced.add(page)
+        else:
+            merged.append((page, text))
+    return merged, replaced
+
+
 def extract_text_pages(path: Path) -> list[tuple[int, str]]:
     return [(1, path.read_text(encoding="utf-8"))]
 
@@ -359,10 +653,11 @@ def resolve_tex_include(root: Path, current: Path, include_name: str) -> Path | 
     candidate = (current.parent / include_name).resolve()
     candidates = [candidate]
     if candidate.suffix.lower() != ".tex":
-        candidates.append(candidate.with_suffix(".tex"))
-    candidates.append((root / include_name).resolve())
-    if (root / include_name).suffix.lower() != ".tex":
-        candidates.append((root / include_name).with_suffix(".tex").resolve())
+        candidates.append(Path(f"{candidate}.tex"))
+    root_candidate = (root / include_name).resolve()
+    candidates.append(root_candidate)
+    if root_candidate.suffix.lower() != ".tex":
+        candidates.append(Path(f"{root_candidate}.tex"))
     for path in candidates:
         try:
             if path.exists() and path.is_file() and root.resolve() in path.resolve().parents:
@@ -400,6 +695,379 @@ def drop_latex_environment(text: str, env: str) -> str:
     return pattern.sub("\n", text)
 
 
+def parse_bibtex_entries(root: Path) -> dict[str, dict[str, str]]:
+    """Parse the small, common BibTeX subset needed for citation display."""
+    entries: dict[str, dict[str, str]] = {}
+    entry_re = re.compile(r"@(?P<type>[A-Za-z]+)\s*\{\s*(?P<key>[^,\s]+)\s*,", re.IGNORECASE)
+    field_re = re.compile(
+        r"(?P<name>[A-Za-z][A-Za-z0-9_-]*)\s*=\s*(?:\{(?P<braced>(?:[^{}]|\{[^{}]*\})*)\}|\"(?P<quoted>(?:[^\"\\]|\\.)*)\")\s*,?",
+        re.DOTALL,
+    )
+    for bib_path in sorted(root.rglob("*.bib")):
+        text = strip_latex_comments(read_text_lossy(bib_path))
+        cursor = 0
+        while match := entry_re.search(text, cursor):
+            depth = 1
+            index = match.end()
+            while index < len(text) and depth:
+                if text[index] == "{":
+                    depth += 1
+                elif text[index] == "}":
+                    depth -= 1
+                index += 1
+            body = text[match.end(): max(match.end(), index - 1)]
+            fields = {
+                item.group("name").lower(): re.sub(
+                    r"\s+", " ", (item.group("braced") or item.group("quoted") or "").replace("{", "").replace("}", "")
+                ).strip()
+                for item in field_re.finditer(body)
+            }
+            entries[match.group("key").strip()] = {
+                "type": match.group("type").lower(),
+                "title": fields.get("title", ""),
+                "authors": fields.get("author", ""),
+                "year": fields.get("year", ""),
+                "url": fields.get("url", "") or fields.get("doi", ""),
+            }
+            cursor = max(index, match.end())
+    return entries
+
+
+def classify_latex_labels(text: str) -> dict[str, dict[str, Any]]:
+    labels: dict[str, dict[str, Any]] = {}
+    counters = {"equation": 0, "figure": 0, "table": 0, "algorithm": 0}
+    section_counters = [0, 0, 0]
+    current_section = ""
+    events = re.compile(
+        r"\\(?P<section>section|subsection|subsubsection)\*?\s*(?:\[[^\]]*\])?\s*\{(?P<title>[^{}]+)\}"
+        r"|\\begin\{(?P<environment>equation\*?|align\*?|alignat\*?|gather\*?|multline\*?|figure\*?|table\*?|algorithm\*?)\}"
+        r"|\\end\{(?P<end_environment>[^{}]+)\}"
+        r"|\\label\s*\{(?P<label>[^{}]+)\}",
+        re.IGNORECASE,
+    )
+    environment_stack: list[str] = []
+    environment_start_stack: list[int] = []
+    for match in events.finditer(text):
+        if match.group("section"):
+            level = {"section": 1, "subsection": 2, "subsubsection": 3}[match.group("section").lower()]
+            section_counters[level - 1] += 1
+            for index in range(level, len(section_counters)):
+                section_counters[index] = 0
+            current_section = ".".join(str(value) for value in section_counters[:level] if value)
+        elif match.group("environment"):
+            environment = match.group("environment").lower().rstrip("*")
+            kind = "equation" if environment in {"equation", "align", "alignat", "gather", "multline"} else environment
+            environment_stack.append(kind)
+            environment_start_stack.append(match.end())
+            counters[kind] = counters.get(kind, 0) + 1
+        elif match.group("end_environment"):
+            if environment_stack:
+                environment_stack.pop()
+                environment_start_stack.pop()
+        elif match.group("label"):
+            key = match.group("label").strip()
+            prefix_kind = {
+                "eq": "equation",
+                "fig": "figure",
+                "tab": "table",
+                "tbl": "table",
+                "alg": "algorithm",
+                "sec": "section",
+            }.get(key.split(":", 1)[0].lower())
+            kind = environment_stack[-1] if environment_stack else (prefix_kind or "section")
+            number = str(counters.get(kind, 0)) if kind != "section" else current_section
+            if kind == "equation" and environment_start_stack:
+                tag_matches = list(re.finditer(r"\\tag\*?\s*\{([^{}]+)\}", text[environment_start_stack[-1]:match.start()]))
+                if tag_matches:
+                    number = tag_matches[-1].group(1).strip()
+            labels[key] = {"kind": kind, "number": number, "title": "", "page": None}
+    return labels
+
+
+def protect_latex_references(text: str, bundle: ReferenceBundle) -> str:
+    citation_order: dict[str, int] = {
+        key: int(value["number"])
+        for key, value in bundle.citations.items()
+        if value.get("number") is not None
+    }
+
+    def replace_reference(match: re.Match[str]) -> str:
+        command = match.group("command")
+        keys = [key.strip() for key in match.group("keys").split(",") if key.strip()]
+        token_kind = "CITE" if command.lower().startswith("cite") else "XREF"
+        token = f"@@{token_kind}_{len(bundle.references) + 1:04d}@@"
+        if token_kind == "CITE":
+            for key in keys:
+                if key not in citation_order:
+                    citation_order[key] = len(citation_order) + 1
+                record = bundle.citations.setdefault(key, {})
+                record["number"] = citation_order[key]
+        bundle.references[token] = {"command": command, "keys": keys, "kind": token_kind.lower()}
+        return token
+
+    return REFERENCE_COMMAND_RE.sub(replace_reference, text)
+
+
+def protect_literal_tokens(text: str, bundle: ReferenceBundle) -> str:
+    def replace_literal(match: re.Match[str]) -> str:
+        token = f"@@LITERAL_{len(bundle.literals) + 1:04d}@@"
+        bundle.literals[token] = match.group(0)
+        return token
+
+    return re.sub(r"</?[A-Za-z][A-Za-z0-9_-]*(?:\s[^>\n]*)?>", replace_literal, text)
+
+
+def reference_tokens(text: str) -> list[str]:
+    return REFERENCE_TOKEN_RE.findall(text)
+
+
+def protected_tokens(text: str) -> list[str]:
+    return PROTECTED_TOKEN_RE.findall(text)
+
+
+def reference_markdown(record: dict[str, Any], bundle: ReferenceBundle) -> str:
+    keys = record.get("keys", [])
+    command = str(record.get("command", "ref"))
+    if record.get("kind") == "cite":
+        numbers = [str(bundle.citations.get(key, {}).get("number", "?")) for key in keys]
+        label = f"[{', '.join(numbers)}]"
+        target = quote(keys[0], safe="") if keys else ""
+        return f"[{label}](#cite:{target})" if target else label
+
+    key = keys[0] if keys else ""
+    label_data = bundle.labels.get(key, {})
+    number = str(label_data.get("number") or key or "?")
+    kind = label_data.get("kind", "reference")
+    prefix = {
+        "equation": "式",
+        "figure": "图",
+        "table": "表",
+        "algorithm": "算法",
+        "section": "第",
+    }.get(kind, "引用")
+    if command.lower() == "ref":
+        label = number
+    elif kind == "section":
+        label = f"第 {number} 节"
+    else:
+        label = f"{prefix} ({number})" if kind == "equation" else f"{prefix} {number}"
+    return f"[{label}](#xref:{quote(key, safe='')})" if key else label
+
+
+def restore_reference_tokens(text: str, bundle: ReferenceBundle) -> str:
+    return REFERENCE_TOKEN_RE.sub(
+        lambda match: reference_markdown(bundle.references.get(match.group(0), {}), bundle),
+        text,
+    )
+
+
+def restore_literal_tokens(text: str, bundle: ReferenceBundle) -> str:
+    return LITERAL_TOKEN_RE.sub(lambda match: bundle.literals.get(match.group(0), match.group(0)), text)
+
+
+def latex_command_argument(text: str, command: str) -> str:
+    match = re.search(rf"\\{re.escape(command)}(?:\[[^\]]*\])?\s*\{{", text, re.IGNORECASE)
+    if not match:
+        return ""
+    start = match.end()
+    depth = 1
+    index = start
+    while index < len(text) and depth:
+        if text[index] == "{" and (index == 0 or text[index - 1] != "\\"):
+            depth += 1
+        elif text[index] == "}" and (index == 0 or text[index - 1] != "\\"):
+            depth -= 1
+        index += 1
+    return text[start:index - 1].strip() if depth == 0 else ""
+
+
+def normalize_asset_text(text: str) -> str:
+    text = re.sub(r"\\textcolor\s*\{[^{}]+\}\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\(?:Require|Ensure|State|While|If|ElsIf|Else|EndIf|EndWhile)\b", " ", text)
+    text = re.sub(r"\\(?:toprule|midrule|bottomrule|hline|centering)\b", " ", text)
+    text = normalize_latex_inline(text)
+    text = re.sub(r"\\(?=\s)", " ", text)
+    return re.sub(r"\s+", " ", text).strip(" \\&")
+
+
+def parse_algorithm_steps(body: str) -> list[dict[str, Any]]:
+    algorithmic_match = re.search(
+        r"\\begin\{algorithmic\}(?:\[[^\]]*\])?([\s\S]*?)\\end\{algorithmic\}",
+        body,
+        re.IGNORECASE,
+    )
+    content = algorithmic_match.group(1) if algorithmic_match else body
+    steps: list[dict[str, Any]] = []
+    indent = 0
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("%"):
+            continue
+        command_match = re.match(r"\\(?P<command>Require|Ensure|State|While|If|ElsIf|Else|EndIf|EndWhile)\b(?P<rest>.*)", line)
+        command = command_match.group("command") if command_match else "State"
+        rest = command_match.group("rest").strip() if command_match else line
+        if command in {"EndIf", "EndWhile", "ElsIf", "Else"}:
+            indent = max(0, indent - 1)
+        if rest.startswith("{") and rest.endswith("}"):
+            rest = rest[1:-1]
+        text = normalize_asset_text(rest)
+        if command in {"EndIf", "EndWhile"}:
+            text = "End if" if command == "EndIf" else "End while"
+        elif command == "Else":
+            text = "Else"
+        if text:
+            steps.append({"keyword": command.lower(), "indent": indent, "source": text, "translation": ""})
+        if command in {"While", "If", "ElsIf", "Else"}:
+            indent += 1
+    return steps
+
+
+def parse_table_rows(body: str) -> list[list[dict[str, str]]]:
+    tabular_match = re.search(
+        r"\\begin\{(?:tabular\*?|tabularx)\}(?:\[[^\]]*\])?\s*\{(?:[^{}]|\{[^{}]*\})*\}([\s\S]*?)"
+        r"\\end\{(?:tabular\*?|tabularx)\}",
+        body,
+        re.IGNORECASE,
+    )
+    content = tabular_match.group(1) if tabular_match else body
+    content = re.sub(r"\\(?:toprule|midrule|bottomrule|hline)\b", "", content)
+    raw_rows = re.split(r"(?<!\\)\\\\(?:\[[^\]]*\])?", content)
+    rows: list[list[dict[str, str]]] = []
+    for raw_row in raw_rows:
+        cells = [normalize_asset_text(cell) for cell in re.split(r"(?<!\\)&", raw_row)]
+        cells = [cell for cell in cells if cell]
+        if cells:
+            rows.append([{"source": cell, "translation": ""} for cell in cells])
+    return rows
+
+
+def resolve_graphic_path(root: Path, name: str) -> Path | None:
+    candidate = (root / name.strip()).resolve()
+    candidates = [candidate]
+    if not candidate.suffix:
+        candidates.extend(candidate.with_suffix(suffix) for suffix in (".pdf", ".png", ".jpg", ".jpeg", ".webp"))
+    for path in candidates:
+        try:
+            if path.is_file() and root.resolve() in path.parents:
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def extract_structured_assets(text: str, root: Path, bundle: ReferenceBundle) -> None:
+    asset_re = re.compile(
+        r"\\begin\{(?P<kind>figure|table|algorithm)(?:\*)?\}(?:\[[^\]]*\])?(?P<body>[\s\S]*?)"
+        r"\\end\{(?P=kind)(?:\*)?\}",
+        re.IGNORECASE,
+    )
+    main_end_match = re.search(r"\\(?:bibliography|appendix)\b|\\section\*?\s*\{\s*(?:Acknowledg|References)", text, re.IGNORECASE)
+    main_end = main_end_match.start() if main_end_match else len(text)
+    for index, match in enumerate(asset_re.finditer(text), start=1):
+        kind = match.group("kind").lower()
+        body = match.group("body")
+        label_match = re.search(r"\\label\s*\{([^{}]+)\}", body)
+        label = label_match.group(1).strip() if label_match else f"{kind}:generated-{index}"
+        label_data = bundle.labels.get(label, {})
+        asset: dict[str, Any] = {
+            "id": f"asset-{slugify(label)}",
+            "label": label,
+            "kind": kind,
+            "number": label_data.get("number") or str(index),
+            "captionSource": normalize_asset_text(latex_command_argument(body, "caption")),
+            "captionTranslation": "",
+            "referenced": False,
+            "inMainBody": match.start() < main_end,
+        }
+        preceding_sections = list(LATEX_SECTION_RE.finditer(text, 0, match.start()))
+        if preceding_sections:
+            asset["sectionTitle"] = normalize_asset_text(preceding_sections[-1].group("title"))
+        if kind == "table":
+            asset["rows"] = parse_table_rows(body)
+        elif kind == "algorithm":
+            asset["steps"] = parse_algorithm_steps(body)
+        else:
+            images: list[dict[str, Any]] = []
+            for graphic in re.finditer(r"\\includegraphics(?:\[[^\]]*\])?\s*\{([^{}]+)\}", body):
+                image_path = resolve_graphic_path(root, graphic.group(1))
+                if image_path:
+                    images.append({"_bytes": image_path.read_bytes(), "_suffix": image_path.suffix.lower()})
+            asset["images"] = images
+        bundle.assets.append(asset)
+        label_data = bundle.labels.setdefault(
+            label,
+            {"kind": kind, "number": asset["number"], "title": asset["captionSource"], "page": None},
+        )
+        label_data["targetAssetId"] = asset["id"]
+        label_data["title"] = asset["captionSource"]
+
+
+def formula_tokens(text: str) -> list[str]:
+    return MATH_TOKEN_RE.findall(text)
+
+
+def restore_math_tokens(text: str, formulas: dict[str, str]) -> str:
+    return MATH_TOKEN_RE.sub(lambda match: formulas.get(match.group(0), match.group(0)), text)
+
+
+def protect_latex_math(
+    text: str,
+    formulas: dict[str, str] | None = None,
+    bundle: ReferenceBundle | None = None,
+) -> tuple[str, dict[str, str]]:
+    formulas = formulas if formulas is not None else {}
+
+    def register(latex: str, *, display: bool) -> str:
+        token = f"@@MATH_{len(formulas) + 1:04d}@@"
+        normalized = latex.strip()
+        formulas[token] = f"$$\n{normalized}\n$$" if display else f"${normalized}$"
+        return token
+
+    for env in MATH_ENVIRONMENTS:
+        escaped_env = re.escape(env)
+        pattern = re.compile(
+            rf"\\begin\{{{escaped_env}\}}([\s\S]*?)\\end\{{{escaped_env}\}}",
+            re.IGNORECASE,
+        )
+
+        def replace_environment(match: re.Match[str], environment: str = env) -> str:
+            body = match.group(1)
+            markers: list[str] = []
+            if bundle is not None:
+                for label_match in re.finditer(r"\\label\s*\{([^{}]+)\}", body):
+                    key = label_match.group(1).strip()
+                    token = f"@@LABEL_{len(bundle.label_tokens) + 1:04d}@@"
+                    bundle.label_tokens[token] = key
+                    markers.append(token)
+            body = re.sub(r"\\label\s*\{[^{}]*\}", "", body).strip()
+            formula = register(f"\\begin{{{environment}}}\n{body}\n\\end{{{environment}}}", display=True)
+            return " ".join([formula, *markers])
+
+        text = pattern.sub(replace_environment, text)
+
+    text = re.sub(
+        r"\\\[([\s\S]*?)\\\]",
+        lambda match: register(match.group(1), display=True),
+        text,
+    )
+    text = re.sub(
+        r"\\\(([\s\S]*?)\\\)",
+        lambda match: register(match.group(1), display=False),
+        text,
+    )
+    text = re.sub(
+        r"(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$",
+        lambda match: register(match.group(1), display=True),
+        text,
+    )
+    text = re.sub(
+        r"(?<!\\)\$(?!\$)([\s\S]*?)(?<!\\)\$(?!\$)",
+        lambda match: register(match.group(1), display=False),
+        text,
+    )
+    return text, formulas
+
+
 def normalize_latex_inline(text: str) -> str:
     replacements = {
         "~": " ",
@@ -431,12 +1099,56 @@ def normalize_latex_inline(text: str) -> str:
     return text
 
 
-def latex_to_plain_text(text: str) -> str:
+def latex_to_protected_document(
+    text: str,
+    bibliography: dict[str, dict[str, str]] | None = None,
+    source_root: Path | None = None,
+) -> tuple[str, dict[str, str], ReferenceBundle]:
     text = strip_latex_comments(text)
+    bundle = ReferenceBundle(labels=classify_latex_labels(text), citations=bibliography or {})
+    simple_macros = {
+        match.group("name"): match.group("value")
+        for match in re.finditer(
+            r"\\(?:newcommand|renewcommand)\s*\{\\(?P<name>[A-Za-z]+)\}"
+            r"(?:\s*\[0\])?\s*\{(?P<value>[^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+            text,
+        )
+    }
+    for name, value in simple_macros.items():
+        text = re.sub(rf"\\{re.escape(name)}\b", lambda _match, replacement=value: replacement, text)
+    one_argument_macros: dict[str, str] = {}
+    macro_start_re = re.compile(r"\\(?:newcommand|renewcommand)\s*\{\\(?P<name>[A-Za-z]+)\}\s*\[1\]\s*\{")
+    for macro_match in macro_start_re.finditer(text):
+        start = macro_match.end()
+        depth = 1
+        index = start
+        while index < len(text) and depth:
+            if text[index] == "{" and text[index - 1] != "\\":
+                depth += 1
+            elif text[index] == "}" and text[index - 1] != "\\":
+                depth -= 1
+            index += 1
+        if depth == 0:
+            one_argument_macros[macro_match.group("name")] = text[start:index - 1]
+    for name, template in one_argument_macros.items():
+        call_re = re.compile(rf"\\{re.escape(name)}\s*\{{([^{{}}]*)\}}")
+        text = call_re.sub(lambda match, value=template: value.replace("#1", match.group(1)), text)
     document_match = re.search(r"\\begin\{document\}([\s\S]*)", text, re.IGNORECASE)
     if document_match:
         text = document_match.group(1)
     text = re.sub(r"\\end\{document\}[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = protect_literal_tokens(text, bundle)
+    text = protect_latex_references(text, bundle)
+    text, formulas = protect_latex_math(text, bundle=bundle)
+    if source_root is not None:
+        extract_structured_assets(text, source_root, bundle)
+
+    def replace_label(match: re.Match[str]) -> str:
+        token = f"@@LABEL_{len(bundle.label_tokens) + 1:04d}@@"
+        bundle.label_tokens[token] = match.group(1).strip()
+        return token
+
+    text = re.sub(r"\\label\s*\{([^{}]+)\}", replace_label, text)
 
     for env in SKIP_LATEX_ENVS:
         text = drop_latex_environment(text, env)
@@ -471,21 +1183,44 @@ def latex_to_plain_text(text: str) -> str:
     text = re.sub(r"\\(?:paragraph|subparagraph)\*?\s*\{([^{}]+)\}", lambda m: f"\n{normalize_latex_inline(m.group(1)).strip()}\n", text)
     text = normalize_latex_inline(text)
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    return "\n".join(line for line in lines if line)
+    return "\n".join(line for line in lines if line), formulas, bundle
 
 
-def extract_latex_pages(path: Path) -> list[tuple[int, str]]:
+def latex_to_protected_text(text: str) -> tuple[str, dict[str, str]]:
+    protected, formulas, _bundle = latex_to_protected_document(text)
+    return protected, formulas
+
+
+def latex_to_plain_text(text: str) -> str:
+    protected, formulas = latex_to_protected_text(text)
+    return restore_math_tokens(protected, formulas)
+
+
+def extract_latex_document_with_references(
+    path: Path,
+) -> tuple[list[tuple[int, str]], dict[str, str], ReferenceBundle]:
     root, temp = latex_root_for(path)
     try:
         main_tex = find_main_tex(root, path)
         expanded = inline_latex_inputs(main_tex, root)
-        plain = latex_to_plain_text(expanded)
+        bibliography = parse_bibtex_entries(root)
+        protected, formulas, bundle = latex_to_protected_document(expanded, bibliography, root)
     finally:
         if temp:
             temp.cleanup()
-    if not plain.strip():
+    if not protected.strip():
         raise RuntimeError("No readable text was extracted from LaTeX source.")
-    return [(1, plain)]
+    return [(1, protected)], formulas, bundle
+
+
+def extract_latex_document(path: Path) -> tuple[list[tuple[int, str]], dict[str, str]]:
+    pages, formulas, _bundle = extract_latex_document_with_references(path)
+    return pages, formulas
+
+
+def extract_latex_pages(path: Path) -> list[tuple[int, str]]:
+    pages, formulas = extract_latex_document(path)
+    return [(page, restore_math_tokens(text, formulas)) for page, text in pages]
 
 
 def split_page_paragraphs(text: str) -> list[str]:
@@ -700,6 +1435,62 @@ def segment_document(pages: list[tuple[int, str]]) -> list[Section]:
     return [section for section in sections if section.paragraphs]
 
 
+def associate_label_targets(sections: list[Section], bundle: ReferenceBundle) -> None:
+    for section in sections:
+        retained: list[Paragraph] = []
+        for paragraph in section.paragraphs:
+            for token in LABEL_TOKEN_RE.findall(paragraph.source):
+                key = bundle.label_tokens.get(token, "")
+                if not key:
+                    continue
+                label = bundle.labels.setdefault(
+                    key,
+                    {"kind": "reference", "number": key, "title": "", "page": paragraph.page},
+                )
+                label["targetSectionId"] = section.id
+                label["page"] = paragraph.page
+                if label.get("kind") != "section":
+                    label["targetParagraphId"] = paragraph.id
+            paragraph.source = re.sub(r"\s*@@LABEL_[0-9]{4,}@@\s*", " ", paragraph.source).strip()
+            if paragraph.source:
+                retained.append(paragraph)
+        section.paragraphs = retained
+
+    assets_by_label = {asset["label"]: asset for asset in bundle.assets}
+    for section in sections:
+        for paragraph in section.paragraphs:
+            for token in reference_tokens(paragraph.source):
+                record = bundle.references.get(token, {})
+                for key in record.get("keys", []):
+                    asset = assets_by_label.get(key)
+                    if asset and not asset.get("referenced"):
+                        asset["referenced"] = True
+                        asset["firstReferencedBy"] = paragraph.id
+    for asset in bundle.assets:
+        if asset.get("referenced") or asset.get("kind") != "figure" or not asset.get("inMainBody"):
+            continue
+        section_title = str(asset.get("sectionTitle") or "").lower()
+        matching_section = next(
+            (
+                section
+                for section in sections
+                if section.paragraphs
+                and (section.title.lower().endswith(section_title) or section_title in section.title.lower())
+            ),
+            None,
+        )
+        if matching_section:
+            asset["referenced"] = True
+            asset["firstReferencedBy"] = matching_section.paragraphs[0].id
+
+
+def restore_all_tokens(text: str, formulas: dict[str, str], bundle: ReferenceBundle) -> str:
+    return restore_literal_tokens(
+        restore_math_tokens(restore_reference_tokens(text, bundle), formulas),
+        bundle,
+    )
+
+
 def heading_order_key(title: str) -> tuple[int, ...] | None:
     match = re.match(r"^([1-9][0-9]?(?:\.[0-9]+)*)\.?\s+", title)
     if not match:
@@ -757,27 +1548,187 @@ def score_extraction_quality(pages: list[tuple[int, str]]) -> float:
     return score
 
 
-def chunk_paragraphs(sections: list[Section], max_chars: int) -> list[list[Paragraph]]:
+def extraction_quality_summary(pages: list[tuple[int, str]]) -> dict[str, Any]:
+    try:
+        sections = segment_document(pages)
+    except Exception:
+        sections = []
+    paragraphs = [paragraph for section in sections for paragraph in section.paragraphs]
+    return {
+        "score": score_extraction_quality(pages),
+        "sections": len(sections),
+        "paragraphs": len(paragraphs),
+        "characters": sum(len(paragraph.source) for paragraph in paragraphs),
+        "has_abstract": any(section.title.lower().startswith("abstract") for section in sections[:3]),
+    }
+
+
+def extraction_is_usable(summary: dict[str, Any]) -> bool:
+    return bool(
+        summary["has_abstract"]
+        and summary["paragraphs"] >= 8
+        and summary["characters"] >= 1200
+        and summary["score"] < 300
+    )
+
+
+def log_extraction_quality(source: str, summary: dict[str, Any]) -> None:
+    print(
+        f"Extraction quality [{source}]: score={summary['score']:.1f}, "
+        f"sections={summary['sections']}, paragraphs={summary['paragraphs']}, "
+        f"characters={summary['characters']}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative tokenizer-free estimate suitable for batching."""
+
+    words_and_symbols = re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", text)
+    return max(1, len(words_and_symbols))
+
+
+def chunk_units(
+    units: list[Paragraph],
+    max_chars: int,
+    *,
+    max_items: int | None = None,
+    target_items: int | None = None,
+) -> list[list[Paragraph]]:
     chunks: list[list[Paragraph]] = []
     current: list[Paragraph] = []
     current_chars = 0
+    current_tokens = 0
+    current_formulas = 0
+    max_tokens = max(600, int(max_chars * 0.58))
+    max_formulas = max(4, min(12, max_chars // 450))
 
-    for section in sections:
-        for paragraph in section.paragraphs:
-            size = len(paragraph.source)
-            if current and current_chars + size > max_chars:
-                chunks.append(current)
-                current = []
-                current_chars = 0
-            current.append(paragraph)
-            current_chars += size
+    for paragraph in units:
+        size = len(paragraph.source)
+        tokens = estimate_tokens(paragraph.source)
+        formulas = len(formula_tokens(paragraph.source))
+        item_limit = max_items is not None and len(current) >= max_items
+        target_reached = target_items is not None and len(current) >= target_items
+        resource_limit = (
+            current_chars + size > max_chars
+            or current_tokens + tokens > max_tokens
+            or current_formulas + formulas > max_formulas
+        )
+        can_split_for_resources = max_items != 6 or len(current) >= 4
+        if current and (item_limit or (resource_limit and can_split_for_resources) or (target_reached and formulas > 0)):
+            chunks.append(current)
+            current = []
+            current_chars = 0
+            current_tokens = 0
+            current_formulas = 0
+        current.append(paragraph)
+        current_chars += size
+        current_tokens += tokens
+        current_formulas += formulas
 
     if current:
         chunks.append(current)
+
+    # Structured batches should normally stay in the requested 4-6 item window.
+    if max_items == 6 and len(chunks) > 1 and len(chunks[-1]) < 4:
+        while len(chunks[-1]) < 4 and len(chunks[-2]) > 4:
+            chunks[-1].insert(0, chunks[-2].pop())
     return chunks
 
 
-def translate_chunk(client: OpenAI, model: str, chunk: list[Paragraph], retries: int) -> dict[str, dict[str, str]]:
+def chunk_paragraphs(sections: list[Section], max_chars: int) -> list[list[Paragraph]]:
+    return chunk_units(
+        [paragraph for section in sections for paragraph in section.paragraphs],
+        max_chars,
+    )
+
+
+def batch_fingerprint(kind: str, chunk: list[Paragraph]) -> str:
+    digest = hashlib.sha256()
+    digest.update(kind.encode("utf-8"))
+    for paragraph in chunk:
+        digest.update(paragraph.id.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(paragraph.source.encode("utf-8"))
+        digest.update(b"\0")
+    return f"{kind}:{digest.hexdigest()[:20]}"
+
+
+def validate_translation_response(data: Any, chunk: list[Paragraph]) -> dict[str, dict[str, str]]:
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise ValueError("Response JSON must contain an items array.")
+
+    expected_ids = [paragraph.id for paragraph in chunk]
+    expected_set = set(expected_ids)
+    validated: dict[str, dict[str, str]] = {}
+    for raw_item in data["items"]:
+        if not isinstance(raw_item, dict):
+            raise ValueError("Each translation item must be an object.")
+        item_id = str(raw_item.get("id", ""))
+        if item_id not in expected_set:
+            raise ValueError(f"Unexpected paragraph id in response: {item_id!r}")
+        if item_id in validated:
+            raise ValueError(f"Duplicate paragraph id in response: {item_id}")
+        status = str(raw_item.get("status", ""))
+        if status not in TRANSLATION_STATUSES:
+            raise ValueError(f"Invalid status for {item_id}: {status!r}")
+        translation = str(raw_item.get("translation", "") or "").strip()
+        note = str(raw_item.get("note", "") or "").strip()
+        if status == "translated" and not translation:
+            raise ValueError(f"Translated item {item_id} has no translation.")
+        paragraph = next(paragraph for paragraph in chunk if paragraph.id == item_id)
+        if status == "translated":
+            expected_formulas = Counter(formula_tokens(paragraph.source))
+            translated_formulas = Counter(formula_tokens(translation))
+            if expected_formulas != translated_formulas:
+                raise FormulaTokenError(
+                    f"Formula tokens changed for {item_id}: expected {expected_formulas}, "
+                    f"received {translated_formulas}.",
+                    item_id,
+                )
+            expected_non_math = Counter(
+                token for token in protected_tokens(paragraph.source) if not token.startswith("@@MATH_")
+            )
+            translated_non_math = Counter(
+                token for token in protected_tokens(translation) if not token.startswith("@@MATH_")
+            )
+            if expected_non_math != translated_non_math:
+                raise ReferenceTokenError(
+                    f"Reference tokens changed for {item_id}: expected {expected_non_math}, "
+                    f"received {translated_non_math}.",
+                    item_id,
+                )
+        if status != "translated":
+            translation = ""
+        if status == "skipped" and not note:
+            note = "Skipped because this item is not main-body prose."
+        if status == "needs_ocr" and not note:
+            note = "The source is not readable enough to translate safely."
+        if status == "needs_formula_recovery" and not note:
+            note = "Mathematical notation could not be recovered reliably."
+        validated[item_id] = {
+            "id": item_id,
+            "status": status,
+            "translation": translation,
+            "note": note,
+        }
+
+    missing = [item_id for item_id in expected_ids if item_id not in validated]
+    if missing:
+        raise ValueError(f"Response omitted paragraph ids: {', '.join(missing)}")
+    return validated
+
+
+def translate_chunk(
+    client: OpenAI,
+    model: str,
+    chunk: list[Paragraph],
+    retries: int,
+    ocr_context_by_page: dict[int, str] | None = None,
+    structured: bool = False,
+    run: TranslationRun | None = None,
+) -> dict[str, dict[str, str]]:
     payload = {
         "paragraphs": [
             {
@@ -787,7 +1738,18 @@ def translate_chunk(client: OpenAI, model: str, chunk: list[Paragraph], retries:
                 "source": paragraph.source,
             }
             for paragraph in chunk
-        ]
+        ],
+        **(
+            {
+                "ocr_page_context": {
+                    str(page): text[:12000]
+                    for page, text in ocr_context_by_page.items()
+                    if any(paragraph.page == page for paragraph in chunk)
+                }
+            }
+            if ocr_context_by_page
+            else {}
+        ),
     }
     system_prompt = (
         "You are a professional academic translator specialized in close reading of research papers. "
@@ -798,9 +1760,9 @@ def translate_chunk(client: OpenAI, model: str, chunk: list[Paragraph], retries:
         "- Keep the Abstract as its own paragraph under the Abstract section.\n"
         "- Exclude all content before the Abstract, including title, author information, affiliations, keywords, venue information, copyright notices, and metadata.\n"
         "- Exclude References/Bibliography and everything after it, including appendices, acknowledgements, author biographies, supplementary material, funding statements, and ethics statements, unless explicitly requested.\n"
-        "- Exclude page headers, footers, page numbers, figure/table captions, footnotes, equations-only blocks, and other non-paragraph artifacts unless they are necessary for understanding the surrounding main text.\n"
-        "- Omit residual OCR or PDF extraction artifacts that look like figure labels, chart axes, legend text, table cells, dense numeric series, or diagram node labels.\n"
-        "- If a paragraph does not belong to the main body, omit it from the output rather than translating it.\n"
+        "- Exclude page headers, footers, page numbers, figure/table captions, footnotes, and other non-paragraph artifacts. Preserve equations that belong to the main argument.\n"
+        "- Treat residual OCR or PDF extraction artifacts such as figure labels, chart axes, legend text, table cells, dense numeric series, or diagram node labels as skipped.\n"
+        "- If a paragraph does not belong to the main body, return it with status skipped.\n"
         "\n"
         "Translation requirements:\n"
         "- Translate into formal, precise, and academically appropriate Chinese.\n"
@@ -809,22 +1771,42 @@ def translate_chunk(client: OpenAI, model: str, chunk: list[Paragraph], retries:
         "- Preserve formulas, citations, section numbers, variable names, dataset names, method names, model names, and technical abbreviations.\n"
         "- For important technical terms, keep the English term in parentheses when useful, especially on first occurrence.\n"
         "- Keep mathematical notation, inline equations, citation markers, and references to figures/tables readable and faithful to the original.\n"
+        "- Formula, reference, and literal placeholders such as @@MATH_0001@@, @@XREF_0001@@, @@CITE_0001@@, and @@LITERAL_0001@@ are immutable. Copy every placeholder exactly once. Never translate, rename, remove, or duplicate one. Reorder placeholders only when Chinese grammar requires it, while preserving which statement each placeholder belongs to.\n"
         "- Do not invent explanations, background knowledge, or missing content.\n"
         "\n"
         "Output requirements:\n"
         "- Return valid JSON only. Do not include markdown, comments, or extra text outside JSON.\n"
-        "- JSON shape: {\"items\":[{\"id\":\"paragraph-id\",\"translation\":\"中文翻译\",\"note\":\"\"}]}.\n"
-        "- Do not drop paragraph ids for translated main-body paragraphs.\n"
+        "- JSON shape: {\"items\":[{\"id\":\"paragraph-id\",\"status\":\"translated\",\"translation\":\"中文翻译\",\"note\":\"\"}]}.\n"
+        "- Return every input paragraph id exactly once. Never omit an id.\n"
+        "- status must be translated, skipped, needs_ocr, or needs_formula_recovery.\n"
+        "- Use translated for readable main-body content and provide a non-empty Chinese translation.\n"
+        "- Use skipped only for definite non-body material or visual artifacts, with an empty translation and a short reason.\n"
+        "- Use needs_ocr when the item may contain useful content but is too corrupted or incomplete to translate safely. Do not guess missing content.\n"
+        "- Use needs_formula_recovery when prose is readable but mathematical notation appears missing or corrupted and no protected formula placeholder is available. Do not invent a formula.\n"
+        "- If ocr_page_context is provided, use only the matching page context to repair the difficult item; do not add unrelated page content.\n"
         "- Keep the original paragraph order.\n"
         "- Use the note field only for brief translation notes, such as ambiguous terminology or unresolved OCR/PDF extraction issues. Otherwise set note to an empty string.\n"
-        "- If no valid main-body paragraphs are found, return {\"items\":[]}."
+        "- Even if no valid main-body paragraphs are found, return every id with status skipped."
     )
+    if structured:
+        system_prompt = (
+            "You translate structured academic paper content into precise Chinese. The inputs are figure captions, "
+            "table cells, training templates, or pseudocode steps that the main text explicitly references. "
+            "Translate every readable item without summarizing. Preserve variable names, control-flow meaning, "
+            "technical terms, XML-like tokens, and ordering. Formula and reference placeholders such as "
+            "@@MATH_0001@@, @@XREF_0001@@, @@CITE_0001@@, and @@LITERAL_0001@@ are immutable and must each be copied exactly once. "
+            "Return JSON only with shape {\"items\":[{\"id\":\"item-id\",\"status\":\"translated\","
+            "\"translation\":\"中文\",\"note\":\"\"}]}. Return every id exactly once. status must be translated, "
+            "skipped, needs_ocr, or needs_formula_recovery; use skipped only for an actually empty/decorative item. "
+            "Never invent missing content."
+        )
     user_prompt = (
         "Translate this json payload. Return json with the same paragraph ids:\n\n"
         f"{json.dumps(payload, ensure_ascii=False)}"
     )
 
     last_error: Exception | None = None
+    empty_response_failures = 0
     for attempt in range(retries + 1):
         try:
             response = client.chat.completions.create(
@@ -836,32 +1818,478 @@ def translate_chunk(client: OpenAI, model: str, chunk: list[Paragraph], retries:
                 response_format={"type": "json_object"},
                 stream=False,
                 max_tokens=8192,
+                extra_body={"thinking": {"type": "disabled"}},
             )
+            if run:
+                run.record_response(response)
             content = response.choices[0].message.content or ""
             if not content.strip():
-                raise RuntimeError("DeepSeek returned empty JSON content.")
+                raise EmptyTranslationResponseError("DeepSeek returned empty JSON content.")
             data = json.loads(content)
-            if not isinstance(data.get("items"), list):
-                raise ValueError("Response JSON must contain an items array.")
-            return {item["id"]: item for item in data["items"]}
+            return validate_translation_response(data, chunk)
         except Exception as error:  # noqa: BLE001 - retries should catch API/JSON failures.
             last_error = error
+            if isinstance(error, ProtectedTokenError):
+                raise
+            if is_non_retryable_api_error(error):
+                status_code = getattr(error, "status_code", "unknown")
+                raise NonRetryableTranslationError(
+                    f"DeepSeek request cannot be retried (HTTP {status_code}): {error}"
+                ) from error
+            if isinstance(error, EmptyTranslationResponseError):
+                empty_response_failures += 1
+                if empty_response_failures >= 2:
+                    break
             if attempt < retries:
+                if run:
+                    run.record_retry()
                 time.sleep(2**attempt)
 
-    raise RuntimeError(f"Translation failed after {retries + 1} attempts: {last_error}")
+    attempts = min(retries + 1, 2) if isinstance(last_error, EmptyTranslationResponseError) else retries + 1
+    raise RuntimeError(f"Translation failed after {attempts} attempts: {last_error}")
 
 
-def apply_translations(sections: list[Section], translations: dict[str, dict[str, str]]) -> None:
+def is_non_retryable_api_error(error: Exception) -> bool:
+    status_code = getattr(error, "status_code", None)
+    return isinstance(status_code, int) and 400 <= status_code < 500 and status_code not in {408, 429}
+
+
+def failed_translation(paragraph: Paragraph, error: Exception) -> dict[str, dict[str, str]]:
+    status = "needs_formula_recovery" if formula_tokens(paragraph.source) else "needs_ocr"
+    print(f"Translation recovery failed for {paragraph.id}: {error}", file=sys.stderr, flush=True)
+    if isinstance(error, FormulaTokenError):
+        note = "公式占位符存在遗漏或重复，已停止自动恢复以避免生成错误公式。"
+    elif isinstance(error, ReferenceTokenError):
+        note = "引用占位符存在遗漏或重复，已停止自动恢复以避免错误引用。"
+    else:
+        note = "该段落在重试后仍无法可靠恢复。"
+    return {
+        paragraph.id: {
+            "id": paragraph.id,
+            "status": status,
+            "translation": "",
+            "note": note,
+        }
+    }
+
+
+def recover_protected_token_failure(
+    model: str,
+    chunk: list[Paragraph],
+    error: ProtectedTokenError,
+    retries: int,
+    ocr_context_by_page: dict[int, str] | None,
+    structured: bool,
+    client: OpenAI,
+    run: TranslationRun | None,
+) -> dict[str, dict[str, str]]:
+    problem_index = next(
+        (index for index, paragraph in enumerate(chunk) if paragraph.id == error.item_id),
+        None,
+    )
+    if problem_index is None:
+        raise error
+    if len(chunk) == 1:
+        return failed_translation(chunk[0], error)
+
+    print(
+        f"Protected-token validation failed for {error.item_id}; retrying that paragraph directly.",
+        file=sys.stderr,
+        flush=True,
+    )
+    if run:
+        run.record_retry()
+    recovered: dict[str, dict[str, str]] = {}
+    segments = [
+        chunk[:problem_index],
+        chunk[problem_index : problem_index + 1],
+        chunk[problem_index + 1 :],
+    ]
+    for segment in segments:
+        if segment:
+            recovered.update(
+                translate_chunk_with_harness(
+                    model,
+                    segment,
+                    retries,
+                    ocr_context_by_page,
+                    structured,
+                    client,
+                    run,
+                )
+            )
+    return recovered
+
+
+def translate_chunk_with_harness(
+    model: str,
+    chunk: list[Paragraph],
+    retries: int,
+    ocr_context_by_page: dict[int, str] | None = None,
+    structured: bool = False,
+    client: OpenAI | None = None,
+    run: TranslationRun | None = None,
+) -> dict[str, dict[str, str]]:
+    active_client = client or create_deepseek_client()
+    try:
+        return translate_chunk(
+            active_client,
+            model,
+            chunk,
+            retries,
+            ocr_context_by_page,
+            structured,
+            run,
+        )
+    except NonRetryableTranslationError:
+        raise
+    except ProtectedTokenError as error:
+        return recover_protected_token_failure(
+            model,
+            chunk,
+            error,
+            retries,
+            ocr_context_by_page,
+            structured,
+            active_client,
+            run,
+        )
+    except Exception as error:  # noqa: BLE001 - split failed batches before giving up.
+        if len(chunk) > 1:
+            midpoint = len(chunk) // 2
+            if run:
+                run.record_retry()
+            print(
+                f"Translation batch failed ({error}); retrying as {midpoint}+{len(chunk) - midpoint} paragraphs.",
+                file=sys.stderr,
+                flush=True,
+            )
+            recovered = translate_chunk_with_harness(
+                model,
+                chunk[:midpoint],
+                retries,
+                ocr_context_by_page,
+                structured,
+                active_client,
+                run,
+            )
+            recovered.update(
+                translate_chunk_with_harness(
+                    model,
+                    chunk[midpoint:],
+                    retries,
+                    ocr_context_by_page,
+                    structured,
+                    active_client,
+                    run,
+                )
+            )
+            return recovered
+
+        return failed_translation(chunk[0], error)
+
+
+def apply_translations(
+    sections: list[Section],
+    translations: dict[str, dict[str, str]],
+    formulas: dict[str, str] | None = None,
+    references: ReferenceBundle | None = None,
+) -> None:
+    formulas = formulas or {}
+    references = references or ReferenceBundle()
     for section in sections:
         for paragraph in section.paragraphs:
             item = translations.get(paragraph.id)
             if not item:
+                paragraph.status = "needs_ocr"
                 paragraph.translation = ""
                 paragraph.note = "Missing translation from API response."
                 continue
-            paragraph.translation = item.get("translation", "")
+            paragraph.status = item.get("status", "needs_ocr")
+            paragraph.translation = restore_all_tokens(item.get("translation", ""), formulas, references)
             paragraph.note = item.get("note", "")
+
+
+def structured_asset_units(bundle: ReferenceBundle) -> tuple[list[Paragraph], dict[str, tuple[dict[str, Any], str]]]:
+    units: list[Paragraph] = []
+    targets: dict[str, tuple[dict[str, Any], str]] = {}
+
+    def register(asset: dict[str, Any], field: str, source: str, suffix: str) -> None:
+        if not source.strip():
+            return
+        unit_id = f"{asset['id']}-{suffix}"
+        units.append(Paragraph(id=unit_id, page=1, anchor=f"{asset['kind']} {asset['number']}", source=source))
+        targets[unit_id] = (asset, field)
+
+    for asset in bundle.assets:
+        if not asset.get("referenced"):
+            continue
+        register(asset, "captionTranslation", asset.get("captionSource", ""), "caption")
+        for row_index, row in enumerate(asset.get("rows", []), start=1):
+            for cell_index, cell in enumerate(row, start=1):
+                source = cell.get("source", "")
+                if len(row) == 1 or len(source) >= 80:
+                    register(asset, f"cell:{row_index - 1}:{cell_index - 1}", source, f"r{row_index}c{cell_index}")
+        for step_index, step in enumerate(asset.get("steps", []), start=1):
+            register(asset, f"step:{step_index - 1}", step.get("source", ""), f"step{step_index}")
+    return units, targets
+
+
+def apply_structured_asset_translations(
+    bundle: ReferenceBundle,
+    translations: dict[str, dict[str, str]],
+    targets: dict[str, tuple[dict[str, Any], str]],
+) -> None:
+    for unit_id, (asset, field) in targets.items():
+        item = translations.get(unit_id, {})
+        translation = item.get("translation", "") if item.get("status") == "translated" else ""
+        if field == "captionTranslation":
+            asset[field] = translation
+        elif field.startswith("cell:"):
+            _, row_index, cell_index = field.split(":")
+            asset["rows"][int(row_index)][int(cell_index)]["translation"] = translation
+        elif field.startswith("step:"):
+            asset["steps"][int(field.split(":")[1])]["translation"] = translation
+
+
+def translate_all_batches(
+    body_chunks: list[list[Paragraph]],
+    structured_chunks: list[list[Paragraph]],
+    model: str,
+    retries: int,
+    parallelism: int,
+    run: TranslationRun,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Run body and structured batches through one shared concurrency limit."""
+
+    queued: list[tuple[str, list[Paragraph]]] = []
+    for index in range(max(len(body_chunks), len(structured_chunks))):
+        if index < len(body_chunks):
+            queued.append(("body", body_chunks[index]))
+        if index < len(structured_chunks):
+            queued.append(("structured", structured_chunks[index]))
+
+    run.total_batches = len(queued)
+    body_translations: dict[str, dict[str, str]] = {}
+    structured_translations: dict[str, dict[str, str]] = {}
+    pending: list[tuple[str, str, list[Paragraph]]] = []
+    for kind, chunk in queued:
+        batch_id = batch_fingerprint(kind, chunk)
+        cached = run.cached(batch_id)
+        if cached is not None:
+            (body_translations if kind == "body" else structured_translations).update(cached)
+            run.completed_batches += 1
+        else:
+            pending.append((kind, batch_id, chunk))
+    run.emit()
+
+    def translate_batch(
+        item: tuple[str, str, list[Paragraph]],
+    ) -> tuple[str, str, dict[str, dict[str, str]]]:
+        kind, batch_id, chunk = item
+        result = translate_chunk_with_harness(
+            model,
+            chunk,
+            retries,
+            structured=kind == "structured",
+            client=run.client,
+            run=run,
+        )
+        run.complete(batch_id, result)
+        return kind, batch_id, result
+
+    workers = bounded_parallelism(parallelism, len(pending)) if pending else 1
+    if pending:
+        print(
+            f"Translating {len(pending)} remaining batches with shared parallelism={workers} "
+            f"({len(body_chunks)} body, {len(structured_chunks)} structured)...",
+            file=sys.stderr,
+            flush=True,
+        )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(translate_batch, item) for item in pending]
+        for future in concurrent.futures.as_completed(futures):
+            kind, batch_id, translations = future.result()
+            (body_translations if kind == "body" else structured_translations).update(translations)
+    return body_translations, structured_translations
+
+
+def materialize_structured_images(bundle: ReferenceBundle, output: Path) -> None:
+    if output.parent.name == "translations":
+        asset_root = output.parent.parent / "paper-assets" / output.stem
+        asset_url_root = f"./paper-assets/{output.stem}"
+    else:
+        asset_root = output.parent / f"{output.stem}-assets"
+        asset_url_root = f"./{output.stem}-assets"
+    for asset in bundle.assets:
+        raw_images = asset.get("images", [])
+        urls: list[str] = []
+        if not asset.get("referenced"):
+            asset["images"] = []
+            continue
+        for image_index, image in enumerate(raw_images, start=1):
+            data = image.pop("_bytes", b"")
+            suffix = image.pop("_suffix", ".png")
+            if not data:
+                continue
+            asset_root.mkdir(parents=True, exist_ok=True)
+            if suffix == ".pdf":
+                import pymupdf
+
+                document = pymupdf.open(stream=data, filetype="pdf")
+                if not document.page_count:
+                    continue
+                pixmap = document[0].get_pixmap(matrix=pymupdf.Matrix(2, 2), alpha=False)
+                filename = f"{asset['id']}-{image_index}.png"
+                pixmap.save(str(asset_root / filename))
+                document.close()
+            else:
+                safe_suffix = suffix if suffix in {".png", ".jpg", ".jpeg", ".webp", ".gif"} else ".png"
+                filename = f"{asset['id']}-{image_index}{safe_suffix}"
+                (asset_root / filename).write_bytes(data)
+            urls.append(f"{asset_url_root}/{filename}")
+        asset["images"] = urls
+
+
+def serialized_structured_assets(
+    bundle: ReferenceBundle,
+    formulas: dict[str, str],
+) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for asset in bundle.assets:
+        if not asset.get("referenced"):
+            continue
+        item = copy.deepcopy({key: value for key, value in asset.items() if not key.startswith("_")})
+        item["captionSource"] = restore_all_tokens(item.get("captionSource", ""), formulas, bundle)
+        item["captionTranslation"] = restore_all_tokens(item.get("captionTranslation", ""), formulas, bundle)
+        for row in item.get("rows", []):
+            for cell in row:
+                cell["source"] = restore_all_tokens(cell.get("source", ""), formulas, bundle)
+                cell["translation"] = restore_all_tokens(cell.get("translation", ""), formulas, bundle)
+        for step in item.get("steps", []):
+            step["source"] = restore_all_tokens(step.get("source", ""), formulas, bundle)
+            step["translation"] = restore_all_tokens(step.get("translation", ""), formulas, bundle)
+        serialized.append(item)
+    return serialized
+
+
+def serialized_cross_reference_labels(
+    bundle: ReferenceBundle,
+    formulas: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    labels = copy.deepcopy(bundle.labels)
+    for metadata in labels.values():
+        metadata["title"] = restore_all_tokens(metadata.get("title", ""), formulas, bundle)
+    return labels
+
+
+def recover_needs_formula_with_docling(
+    pdf: Path,
+    sections: list[Section],
+    translations: dict[str, dict[str, str]],
+    model: str,
+    retries: int,
+    client: OpenAI | None = None,
+    run: TranslationRun | None = None,
+) -> set[int]:
+    difficult = [
+        paragraph
+        for section in sections
+        for paragraph in section.paragraphs
+        if translations.get(paragraph.id, {}).get("status") == "needs_formula_recovery"
+    ]
+    if not difficult:
+        return set()
+
+    pages = {paragraph.page for paragraph in difficult}
+    page_range = ",".join(str(page) for page in sorted(pages))
+    print(
+        f"{len(difficult)} items requested formula recovery on pages {page_range}; running Docling formula enrichment...",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        formula_context = dict(
+            extract_pdf_pages_docling(
+                pdf,
+                page_range,
+                force_ocr=False,
+                enrich_formulas=True,
+            )
+        )
+    except Exception as error:  # noqa: BLE001 - retain explicit formula recovery status.
+        print(f"Docling formula recovery unavailable: {error}", file=sys.stderr, flush=True)
+        return set()
+
+    recovered_pages: set[int] = set()
+    for page in sorted(pages):
+        page_paragraphs = [paragraph for paragraph in difficult if paragraph.page == page]
+        if not formula_context.get(page, "").strip():
+            continue
+        recovered = translate_chunk_with_harness(
+            model,
+            page_paragraphs,
+            retries,
+            {page: formula_context[page]},
+            client=client,
+            run=run,
+        )
+        for paragraph_id, item in recovered.items():
+            translations[paragraph_id] = item
+            if item.get("status") != "needs_formula_recovery":
+                recovered_pages.add(page)
+    return recovered_pages
+
+
+def recover_needs_ocr_with_docling(
+    pdf: Path,
+    sections: list[Section],
+    translations: dict[str, dict[str, str]],
+    model: str,
+    retries: int,
+    client: OpenAI | None = None,
+    run: TranslationRun | None = None,
+) -> set[int]:
+    difficult = [
+        paragraph
+        for section in sections
+        for paragraph in section.paragraphs
+        if translations.get(paragraph.id, {}).get("status") == "needs_ocr"
+    ]
+    if not difficult:
+        return set()
+
+    pages = {paragraph.page for paragraph in difficult}
+    page_range = ",".join(str(page) for page in sorted(pages))
+    print(
+        f"{len(difficult)} items requested OCR help on pages {page_range}; running Docling...",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        ocr_context = dict(extract_pdf_pages_docling(pdf, page_range, force_ocr=True))
+    except Exception as error:  # noqa: BLE001 - retain explicit needs_ocr statuses.
+        print(f"Docling recovery unavailable: {error}", file=sys.stderr, flush=True)
+        return set()
+
+    recovered_pages: set[int] = set()
+    for page in sorted(pages):
+        page_paragraphs = [paragraph for paragraph in difficult if paragraph.page == page]
+        if not ocr_context.get(page, "").strip():
+            continue
+        recovered = translate_chunk_with_harness(
+            model,
+            page_paragraphs,
+            retries,
+            {page: ocr_context[page]},
+            client=client,
+            run=run,
+        )
+        for paragraph_id, item in recovered.items():
+            translations[paragraph_id] = item
+            if item.get("status") != "needs_ocr":
+                recovered_pages.add(page)
+    return recovered_pages
 
 
 def build_output(
@@ -870,23 +2298,42 @@ def build_output(
     coverage: str,
     source_note: str,
     sections: list[Section],
+    extraction_method: str,
+    formula_count: int,
+    formulas: dict[str, str] | None = None,
+    references: ReferenceBundle | None = None,
 ) -> dict[str, Any]:
+    formulas = formulas or {}
+    references = references or ReferenceBundle()
+    status_counts = {status: 0 for status in sorted(TRANSLATION_STATUSES)}
+    for section in sections:
+        for paragraph in section.paragraphs:
+            status_counts[paragraph.status or "needs_ocr"] += 1
     return {
         "title": title,
         "paperUrl": paper_url,
         "coverage": coverage,
         "source": source_note,
+        "extractionMethod": extraction_method,
+        "contentFormat": "markdown+latex",
+        "formulaCount": formula_count,
+        "crossReferences": {"labels": serialized_cross_reference_labels(references, formulas)},
+        "citations": references.citations,
+        "structuredContent": serialized_structured_assets(references, formulas),
+        "statusCounts": status_counts,
         "sections": [
             {
                 "id": section.id,
-                "title": section.title,
+                "title": restore_all_tokens(section.title, formulas, references),
                 "pageStart": section.page_start,
                 "pageEnd": section.page_end,
                 "paragraphs": [
                     {
                         "id": paragraph.id,
                         "page": paragraph.page,
-                        "anchor": paragraph.anchor,
+                        "anchor": restore_all_tokens(paragraph.anchor, formulas, references),
+                        "sourceText": restore_all_tokens(paragraph.source, formulas, references),
+                        "status": paragraph.status or "needs_ocr",
                         "translation": paragraph.translation,
                         **({"note": paragraph.note} if paragraph.note else {}),
                     }
@@ -934,81 +2381,174 @@ def generate_translation_json(
     retries: int,
     dry_run: bool,
     pdf_extractor: PDF_EXTRACTOR = "auto",
+    progress_callback: ProgressCallback | None = None,
+    resume: bool = True,
 ) -> dict[str, Any]:
-    if pdf:
-        extracted_pages = extract_pdf_pages(pdf, pages, pdf_extractor)
-        source_name = str(pdf)
-    elif latex:
-        extracted_pages = extract_latex_pages(latex)
-        source_name = str(latex)
-    elif text:
+    extracted_pages: list[tuple[int, str]] = []
+    source_name = ""
+    extraction_method = ""
+    extraction_ocr_pages: set[int] = set()
+    formula_recovery_pages: set[int] = set()
+    formulas: dict[str, str] = {}
+    references = ReferenceBundle()
+
+    if text:
         extracted_pages = extract_text_pages(text)
         source_name = str(text)
-    else:
+        extraction_method = "text"
+    elif latex:
+        try:
+            latex_pages, formulas, references = extract_latex_document_with_references(latex)
+            latex_summary = extraction_quality_summary(latex_pages)
+            log_extraction_quality("latex", latex_summary)
+            if extraction_is_usable(latex_summary) or not pdf:
+                extracted_pages = latex_pages
+                source_name = str(latex)
+                extraction_method = "latex"
+            else:
+                print("LaTeX extraction is incomplete; falling back to PDF.", file=sys.stderr, flush=True)
+        except Exception as error:  # noqa: BLE001 - auto mode may still use the PDF.
+            if not pdf:
+                raise
+            print(f"LaTeX extraction failed ({error}); falling back to PDF.", file=sys.stderr, flush=True)
+
+    if not extracted_pages and pdf:
+        formulas = {}
+        extracted_pages, extraction_ocr_pages = extract_pdf_pages_adaptive(pdf, pages, pdf_extractor)
+        native_summary = extraction_quality_summary(extracted_pages)
+        log_extraction_quality("pdf-native", native_summary)
+        source_name = str(pdf)
+        extraction_method = "pdf-native+docling-ocr" if extraction_ocr_pages else "pdf-native"
+
+        if not extraction_is_usable(native_summary):
+            try:
+                docling_pages = extract_pdf_pages_docling(
+                    pdf,
+                    pages,
+                    force_ocr=True,
+                    enrich_formulas=True,
+                )
+                docling_summary = extraction_quality_summary(docling_pages)
+                log_extraction_quality("docling-ocr", docling_summary)
+                if docling_summary["score"] < native_summary["score"]:
+                    extracted_pages = docling_pages
+                    extraction_method = "docling-ocr"
+                    extraction_ocr_pages = {page for page, _text in docling_pages}
+            except Exception as error:  # noqa: BLE001 - keep the best native result.
+                print(f"Full Docling fallback unavailable: {error}", file=sys.stderr, flush=True)
+    elif not extracted_pages and not text:
         raise ValueError("Either pdf, latex, or text must be provided.")
 
     if not extracted_pages:
         raise RuntimeError("No text pages were extracted.")
 
+    if extraction_method != "latex":
+        protected_pages: list[tuple[int, str]] = []
+        for page, page_text in extracted_pages:
+            protected_text, formulas = protect_latex_math(page_text, formulas)
+            protected_pages.append((page, protected_text))
+        extracted_pages = protected_pages
+
     sections = segment_document(extracted_pages)
+    associate_label_targets(sections, references)
     if not sections:
         raise RuntimeError("No paragraphs were detected.")
+    body_formula_count = sum(
+        len(formula_tokens(paragraph.source))
+        for section in sections
+        for paragraph in section.paragraphs
+    )
 
     if dry_run:
         for section in sections:
             for paragraph in section.paragraphs:
+                paragraph.status = "translated"
                 paragraph.translation = "TODO"
                 paragraph.note = "Dry run placeholder."
     else:
         active_model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        translations: dict[str, dict[str, str]] = {}
-        chunks = chunk_paragraphs(sections, max_chars)
-        workers = bounded_parallelism(parallelism, len(chunks))
-        if workers == 1:
-            client = create_deepseek_client()
-            for index, chunk in enumerate(chunks, start=1):
-                print(
-                    f"Translating chunk {index}/{len(chunks)} ({len(chunk)} paragraphs)...",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                translations.update(translate_chunk(client, active_model, chunk, retries))
-        else:
-            print(
-                f"Translating {len(chunks)} chunks with parallelism={workers}...",
-                file=sys.stderr,
-                flush=True,
+        body_chunks = chunk_paragraphs(sections, max_chars)
+        structured_units, structured_targets = structured_asset_units(references)
+        structured_chunks = chunk_units(
+            structured_units,
+            min(max_chars, 2600),
+            max_items=6,
+            target_items=5,
+        )
+        fingerprint_data = {
+            "model": active_model,
+            "maxChars": max_chars,
+            "body": [[paragraph.id, paragraph.source] for chunk in body_chunks for paragraph in chunk],
+            "structured": [[paragraph.id, paragraph.source] for paragraph in structured_units],
+        }
+        paper_fingerprint = hashlib.sha256(
+            json.dumps(fingerprint_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        checkpoint_path = Path(__file__).resolve().parents[1] / "papers_to_translate" / "checkpoints" / (
+            f"{output.stem}-{paper_fingerprint[:16]}.json"
+        )
+        if not resume:
+            checkpoint_path.unlink(missing_ok=True)
+        run = TranslationRun(
+            client=create_deepseek_client(),
+            fingerprint=paper_fingerprint,
+            checkpoint_path=checkpoint_path,
+            progress_callback=progress_callback,
+        )
+        translations, structured_translations = translate_all_batches(
+            body_chunks,
+            structured_chunks,
+            active_model,
+            retries,
+            parallelism,
+            run,
+        )
+        apply_structured_asset_translations(references, structured_translations, structured_targets)
+        recovery_pages: set[int] = set()
+        if pdf and extraction_method.startswith(("pdf", "docling")):
+            formula_recovery_pages = recover_needs_formula_with_docling(
+                pdf,
+                sections,
+                translations,
+                active_model,
+                retries,
+                run.client,
+                run,
             )
+            recovery_pages = recover_needs_ocr_with_docling(
+                pdf,
+                sections,
+                translations,
+                active_model,
+                retries,
+                run.client,
+                run,
+            )
+        extraction_ocr_pages.update(recovery_pages)
+        apply_translations(sections, translations, formulas, references)
 
-            def translate_indexed_chunk(index_and_chunk: tuple[int, list[Paragraph]]) -> tuple[int, dict[str, dict[str, str]]]:
-                index, chunk = index_and_chunk
-                print(
-                    f"Starting chunk {index}/{len(chunks)} ({len(chunk)} paragraphs)...",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return index, translate_chunk(create_deepseek_client(), active_model, chunk, retries)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(translate_indexed_chunk, (index, chunk))
-                    for index, chunk in enumerate(chunks, start=1)
-                ]
-                for future in concurrent.futures.as_completed(futures):
-                    index, chunk_translations = future.result()
-                    translations.update(chunk_translations)
-                    print(
-                        f"Finished chunk {index}/{len(chunks)}.",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-        apply_translations(sections, translations)
-
+    materialize_structured_images(references, output)
     source_note = (
-        f"Generated from {source_name}. The PDF remains the authoritative original; "
-        "this JSON stores Chinese translations and short anchors, not full original text."
+        f"Generated from {source_name} using {extraction_method}. "
+        f"Docling OCR pages: {', '.join(map(str, sorted(extraction_ocr_pages))) or 'none'}. "
+        f"Docling formula recovery pages: {', '.join(map(str, sorted(formula_recovery_pages))) or 'none'}. "
+        "The PDF remains the authoritative original; "
+        "this JSON stores Chinese translations, source paragraphs, formulas, and cross-reference metadata."
     )
-    result = build_output(title, paper_url, coverage, source_note, sections)
+    result = build_output(
+        title,
+        paper_url,
+        coverage,
+        source_note,
+        sections,
+        extraction_method,
+        body_formula_count,
+        formulas,
+        references,
+    )
+    if not dry_run:
+        result["translationProgress"] = run.snapshot("completed")
+        run.emit("completed")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return result
@@ -1032,7 +2572,7 @@ def parse_args() -> argparse.Namespace:
         help="PDF text extractor. auto prefers PyMuPDF layout filtering and falls back to pypdf.",
     )
     parser.add_argument("--coverage", default="Full paper text extracted from the provided input.")
-    parser.add_argument("--max-chars", type=int, default=12000, help="Approximate source chars per API call.")
+    parser.add_argument("--max-chars", type=int, default=4000, help="Approximate source chars per API call.")
     parser.add_argument(
         "--parallelism",
         type=int,

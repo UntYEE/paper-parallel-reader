@@ -1,4 +1,5 @@
 fastapi
+docling>=2.70,<3
 openai
 PyMuPDF
 pypdf
