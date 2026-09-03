@@ -340,6 +340,20 @@ h1 { margin: 0; color: var(--topbar-text); font-size: 17px; font-weight: 700; li
   box-shadow: 0 1px 0 rgb(255 255 255 / 75%);
 }
 #paper-form { position: relative; z-index: 9; }
+.cached-paper-select {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text-soft);
+  background: var(--surface-raised);
+  font: inherit;
+  font-size: 12px;
+  text-overflow: ellipsis;
+}
 .toolbar-label { color: color-mix(in srgb, var(--text) 78%, var(--info)); font-size: 12px; font-weight: 700; }
 .toolbar input[type="url"], .toolbar input[type="search"], .toolbar input[type="text"], .translation-tools input {
   width: 100%;

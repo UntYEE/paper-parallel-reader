@@ -29,6 +29,7 @@ const paperFrame = document.querySelector("#paper-frame");
 const pdfUrlInput = document.querySelector("#pdf-url");
 const pdfFileInput = document.querySelector("#pdf-file");
 const paperSearchResults = document.querySelector("#paper-search-results");
+const cachedPaperSelect = document.querySelector("#cached-paper-select");
 const translationUrlInput = document.querySelector("#translation-url");
 const translationFileInput = document.querySelector("#translation-file");
 const translationList = document.querySelector("#translation-list");
@@ -72,6 +73,8 @@ let currentPaperFile = null;
 let currentPaperId = "";
 let selectedChatParagraphId = "";
 let loadedChatPaperId = "";
+let cachedPapers = [];
+let cachedSelectionRevision = 0;
 
 function savedPdfNameFromUrl(url) {
   try {
@@ -133,6 +136,7 @@ function applyPaperInfo(data) {
 function selectSavedPdf(name) {
   currentSavedPdfName = name || "";
   generateSavedPdfSelect.value = currentSavedPdfName;
+  cachedPaperSelect.value = currentSavedPdfName;
 }
 
 function pageRange(section) {
@@ -602,12 +606,18 @@ async function checkBackend() {
   }
 }
 
-async function refreshDownloadedPapers(selectedName = currentSavedPdfName) {
+async function refreshDownloadedPapers(selectedName = null) {
   try {
     const response = await fetch(`${BACKEND_URL}/api/papers`, { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     const papers = Array.isArray(data.papers) ? data.papers : [];
+    cachedPapers = papers;
+    cachedPaperSelect.replaceChildren();
+    const cachePlaceholder = document.createElement("option");
+    cachePlaceholder.value = "";
+    cachePlaceholder.textContent = papers.length ? `已缓存论文（${papers.length}）` : "暂无已缓存论文";
+    cachedPaperSelect.append(cachePlaceholder);
     generateSavedPdfSelect.innerHTML = "";
 
     const emptyOption = document.createElement("option");
@@ -618,17 +628,59 @@ async function refreshDownloadedPapers(selectedName = currentSavedPdfName) {
     papers.forEach((paper) => {
       const option = document.createElement("option");
       option.value = paper.name;
-      option.textContent = paper.translationUrl ? `${paper.name} (cached)` : paper.name;
+      option.textContent = `${paper.title || paper.name} · ${paper.translationUrl ? "已有译文" : "仅 PDF"}`;
       option.dataset.sourceUrl = paper.sourceUrl || "";
       option.dataset.fileUrl = paper.fileUrl || "";
       option.dataset.pdfUrl = paper.pdfUrl || "";
       option.dataset.translationUrl = paper.translationUrl || "";
       generateSavedPdfSelect.append(option);
+      cachedPaperSelect.append(option.cloneNode(true));
     });
 
-    selectSavedPdf(selectedName && papers.some((paper) => paper.name === selectedName) ? selectedName : "");
+    const preferredName = selectedName === null ? currentSavedPdfName : selectedName;
+    selectSavedPdf(preferredName && papers.some((paper) => paper.name === preferredName) ? preferredName : "");
   } catch {
     generateSavedPdfSelect.innerHTML = '<option value="">Backend offline</option>';
+    cachedPaperSelect.innerHTML = '<option value="">缓存读取失败，点击重试</option>';
+  }
+}
+
+async function openCachedPaper(name) {
+  const paper = cachedPapers.find((item) => item.name === name);
+  if (!paper) return;
+  const revision = ++cachedSelectionRevision;
+  hidePaperSearchResults();
+  currentPaperFile = null;
+  generatePdfInput.value = "";
+  pdfFileInput.value = "";
+  searchBox.value = "";
+  closeChat();
+  selectedChatParagraphId = "";
+  loadedChatPaperId = "";
+  chatSend.disabled = true;
+  chatMessages.replaceChildren();
+  applyPaperInfo(paper);
+  renderTranslation({ title: paper.title || paper.name, paperId: paper.paperId,
+    paperUrl: paper.sourceUrl, sections: [] });
+  translationUrlInput.value = "";
+  if (!paper.translationUrl) {
+    translationList.querySelector(".empty").textContent = "这篇论文尚未生成译文";
+    setGenerateStatus("已载入本地 PDF，尚未生成译文", "ok");
+    return;
+  }
+  setGenerateStatus("正在载入缓存译文...", "busy");
+  try {
+    const url = new URL(paper.translationUrl, BACKEND_URL).href;
+    const response = await fetch(url, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (revision !== cachedSelectionRevision) return;
+    translationUrlInput.value = url;
+    renderTranslation(data);
+    setGenerateStatus("已载入缓存论文及译文", "ok");
+  } catch (error) {
+    if (revision !== cachedSelectionRevision) return;
+    setGenerateStatus(`PDF 已载入，缓存译文读取失败：${error.message}`, "warn");
   }
 }
 
@@ -955,20 +1007,11 @@ translationFileInput.addEventListener("change", () => {
 });
 
 generateSavedPdfSelect.addEventListener("change", () => {
-  const option = generateSavedPdfSelect.selectedOptions[0];
-  const fileUrl = option?.dataset.fileUrl;
-  const sourceUrl = option?.dataset.sourceUrl;
-  currentSavedPdfName = generateSavedPdfSelect.value;
-  if (fileUrl) {
-    currentPaperFile = null;
-    setPaperUrl(`${BACKEND_URL}${fileUrl}`, sourceUrl || `${BACKEND_URL}${fileUrl}`);
-    generateOutputInput.value = outputNameFromPdf(currentSavedPdfName);
-    if (option.dataset.translationUrl) {
-      loadTranslation(option.dataset.translationUrl);
-      setGenerateStatus("Cached translation available", "ok");
-    }
-  }
+  if (generateSavedPdfSelect.value) openCachedPaper(generateSavedPdfSelect.value);
+  else selectSavedPdf("");
 });
+cachedPaperSelect.addEventListener("change", () => openCachedPaper(cachedPaperSelect.value));
+cachedPaperSelect.addEventListener("focus", () => refreshDownloadedPapers());
 
 searchBox.addEventListener("input", () => {
   renderTranslation(currentData, searchBox.value);

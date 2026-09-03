@@ -38,6 +38,9 @@
           <button class="primary-button" type="submit">检索</button>
           <label class="file-button" for="pdf-file">上传 PDF</label>
           <input id="pdf-file" type="file" accept="application/pdf" />
+          <select id="cached-paper-select" class="cached-paper-select" aria-label="已缓存论文" title="已缓存论文">
+            <option value="">正在读取已缓存论文...</option>
+          </select>
           <div id="paper-search-results" class="paper-search-results" hidden></div>
         </form>
         <iframe id="paper-frame" title="paper pdf"></iframe>

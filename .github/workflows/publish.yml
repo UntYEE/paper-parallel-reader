@@ -35,6 +35,9 @@ jobs:
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
+      - name: Run viewer tests
+        run: node --test tests/cached_papers.test.cjs
+
       - name: Validate Compose files
         run: |
           cp .env.example .env
