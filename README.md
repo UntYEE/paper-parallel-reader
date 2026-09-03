@@ -21,13 +21,22 @@
 ### 下载后双击启动（推荐）
 
 1. 安装并启动 [Docker Desktop](https://www.docker.com/products/docker-desktop/)。
-2. 打开 [GitHub Releases](https://github.com/UntYEE/paper-parallel-reader/releases/latest)，下载最新的 `paper-parallel-reader-版本号.zip` 并解压。
-3. macOS 双击 `启动.command`；Windows 双击 `启动-Windows.bat`。
-4. 首次启动时输入自己的 DeepSeek API Key，并选择普通版或 OCR 版。
+2. 打开 [GitHub Releases](https://github.com/UntYEE/paper-parallel-reader/releases/latest)，下载最新的 `paper-parallel-reader-版本号.zip`。
+3. Windows 用户在解压前右键点击 ZIP，选择 **属性**，勾选底部的 **解除锁定**，再点击 **应用**；然后解压。
+4. macOS 双击 `启动.command`；Windows 双击 `启动-Windows.bat`。
+5. 首次启动时输入自己的 DeepSeek API Key，并选择普通版或 OCR 版。
 
 启动器会自动下载预构建镜像、启动服务并打开浏览器，不需要安装 Git、Python，也不需要编译项目。API Key 的输入内容不会显示，只会保存在解压目录的 `.env` 文件中。
 
-macOS 如果阻止首次运行，可以右键点击 `启动.command`，选择 **打开**。Windows 用户也可以右键点击 `启动.ps1`，选择 **使用 PowerShell 运行**。
+macOS 如果阻止首次运行，可以右键点击 `启动.command`，选择 **打开**。
+
+如果 Windows 已经解压后才出现“智能应用控制已阻止可能不安全的文件”：
+
+1. 删除刚才解压出的文件夹。
+2. 右键点击原始 ZIP，选择 **属性 → 解除锁定 → 应用**。
+3. 重新解压 ZIP，再双击 `启动-Windows.bat`。
+
+只应对从本项目 GitHub Release 下载并核对过 SHA-256 的文件解除锁定，不要关闭 Smart App Control。如果电脑由学校或公司管理且没有“解除锁定”选项，请保留安全策略，改用下方 Docker 命令启动或联系管理员。
 
 ### 使用 Docker 命令启动
 

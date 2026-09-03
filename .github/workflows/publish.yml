@@ -168,14 +168,17 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           archive="dist/paper-parallel-reader-${version}.zip"
           git archive --format=zip --prefix="paper-parallel-reader-${version}/" --output="${archive}" HEAD
+          (cd dist && sha256sum "paper-parallel-reader-${version}.zip" > "paper-parallel-reader-${version}.zip.sha256")
           echo "RELEASE_ARCHIVE=${archive}" >> "${GITHUB_ENV}"
+          echo "RELEASE_CHECKSUM=${archive}.sha256" >> "${GITHUB_ENV}"
 
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" "${RELEASE_ARCHIVE}" --clobber
+            gh release upload "${GITHUB_REF_NAME}" "${RELEASE_ARCHIVE}" "${RELEASE_CHECKSUM}" --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" "${RELEASE_ARCHIVE}" --verify-tag --generate-notes
+            gh release create "${GITHUB_REF_NAME}" "${RELEASE_ARCHIVE}" "${RELEASE_CHECKSUM}" \
+              --verify-tag --generate-notes
           fi

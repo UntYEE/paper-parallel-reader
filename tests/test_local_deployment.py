@@ -131,6 +131,7 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertIn("target: runtime-ocr", workflow)
         self.assertIn("docker buildx imagetools create", workflow)
         self.assertIn("git archive --format=zip", workflow)
+        self.assertIn("sha256sum", workflow)
         self.assertIn('tags:\n      - "v*"', workflow)
 
     def test_readme_contains_only_feature_and_deployment_sections(self) -> None:
@@ -140,6 +141,7 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertEqual(["## 功能说明", "## 部署教程"], headings)
         self.assertIn("启动.command", readme)
         self.assertIn("启动-Windows.bat", readme)
+        self.assertIn("属性 → 解除锁定 → 应用", readme)
 
 
 class TaskStoreTests(unittest.TestCase):
