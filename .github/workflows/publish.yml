@@ -183,6 +183,8 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=${{ matrix.channel }}
             type=semver,pattern={{version}}${{ matrix.suffix }}

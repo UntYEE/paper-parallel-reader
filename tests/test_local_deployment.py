@@ -145,6 +145,7 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertIn("test-windows-launcher:", workflow)
         self.assertIn("windows-latest", workflow)
         self.assertIn("daemon is not using the default seccomp profile", workflow)
+        self.assertIn("latest=false", workflow)
         self.assertIn('tags:\n      - "v*"', workflow)
 
     def test_readme_contains_only_feature_and_deployment_sections(self) -> None:
