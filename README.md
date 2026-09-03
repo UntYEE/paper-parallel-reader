@@ -1,6 +1,7 @@
 # Paper Parallel Reader
 
 更新：0.1.5版本Windows系统可以稳定使用
+
 一个在本机并排阅读论文原文与中文译文的 Web 应用。
 
 ## 功能说明
