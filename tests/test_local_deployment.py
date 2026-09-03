@@ -120,11 +120,17 @@ class LocalSecurityTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
         mac_launcher = root / "启动.command"
-        windows_launcher = root / "启动.ps1"
+        windows_launcher = root / "start.ps1"
         batch_launcher = root / "启动-Windows.bat"
         self.assertTrue(mac_launcher.stat().st_mode & 0o100)
         self.assertTrue(windows_launcher.is_file())
         self.assertTrue(batch_launcher.is_file())
+        self.assertTrue(windows_launcher.read_bytes().startswith(b"\xef\xbb\xbf"))
+        batch_bytes = batch_launcher.read_bytes()
+        self.assertEqual(batch_bytes, batch_bytes.decode("ascii").encode("ascii"))
+        self.assertIn(b"\r\n", batch_bytes)
+        self.assertNotIn(b"\n", batch_bytes.replace(b"\r\n", b""))
+        self.assertIn(b"%~dp0start.ps1", batch_bytes)
         self.assertIn("runner: ubuntu-24.04-arm", workflow)
         self.assertIn("platform: linux/amd64", workflow)
         self.assertIn("platform: linux/arm64", workflow)

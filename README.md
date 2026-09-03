@@ -36,6 +36,8 @@ macOS 如果阻止首次运行，可以右键点击 `启动.command`，选择 **
 2. 右键点击原始 ZIP，选择 **属性 → 解除锁定 → 应用**。
 3. 重新解压 ZIP，再双击 `启动-Windows.bat`。
 
+如果命令窗口显示“`'p' 不是内部或外部命令`”或“`'ershell.exe' 不是内部或外部命令`”，说明使用的是早期发布包，请重新下载最新版 Release。新版 Windows 启动器使用标准 CRLF 换行和纯英文脚本文件名，可兼容 Windows 10/11 自带的 Windows PowerShell。
+
 只应对从本项目 GitHub Release 下载并核对过 SHA-256 的文件解除锁定，不要关闭 Smart App Control。如果电脑由学校或公司管理且没有“解除锁定”选项，请保留安全策略，改用下方 Docker 命令启动或联系管理员。
 
 ### 使用 Docker 命令启动

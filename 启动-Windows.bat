@@ -1,4 +1,7 @@
 @echo off
-chcp 65001 >nul
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0启动.ps1"
-if errorlevel 1 pause
+setlocal
+cd /d "%~dp0"
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1"
+set "PPR_EXIT=%ERRORLEVEL%"
+if not "%PPR_EXIT%"=="0" pause
+exit /b %PPR_EXIT%
