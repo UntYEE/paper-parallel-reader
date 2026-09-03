@@ -125,8 +125,11 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertTrue(mac_launcher.stat().st_mode & 0o100)
         self.assertTrue(windows_launcher.is_file())
         self.assertTrue(batch_launcher.is_file())
-        self.assertIn("linux/amd64,linux/arm64", workflow)
+        self.assertIn("runner: ubuntu-24.04-arm", workflow)
+        self.assertIn("platform: linux/amd64", workflow)
+        self.assertIn("platform: linux/arm64", workflow)
         self.assertIn("target: runtime-ocr", workflow)
+        self.assertIn("docker buildx imagetools create", workflow)
         self.assertIn("git archive --format=zip", workflow)
         self.assertIn('tags:\n      - "v*"', workflow)
 
