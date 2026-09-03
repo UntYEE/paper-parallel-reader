@@ -1,6 +1,6 @@
 services:
   reader:
-    build:
-      target: runtime-ocr
+    image: ${PAPER_READER_OCR_IMAGE:-ghcr.io/untyee/paper-parallel-reader:ocr}
+    pull_policy: always
     environment:
       ENABLE_OCR: "true"

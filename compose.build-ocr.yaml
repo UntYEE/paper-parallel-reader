@@ -1,0 +1,7 @@
+services:
+  reader:
+    image: paper-parallel-reader:ocr-local
+    pull_policy: never
+    build:
+      context: .
+      target: runtime-ocr

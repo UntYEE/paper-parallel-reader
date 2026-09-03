@@ -18,20 +18,26 @@
 
 ## 部署教程
 
-### Docker 部署（推荐）
+### 下载后双击启动（推荐）
 
-适用于 macOS、Windows 和 Linux。请先安装 Docker Desktop，或 Docker Engine 与 Compose 插件，并申请自己的 DeepSeek API Key。
+1. 安装并启动 [Docker Desktop](https://www.docker.com/products/docker-desktop/)。
+2. 打开 [GitHub Releases](https://github.com/UntYEE/paper-parallel-reader/releases/latest)，下载最新的 `paper-parallel-reader-版本号.zip` 并解压。
+3. macOS 双击 `启动.command`；Windows 双击 `启动-Windows.bat`。
+4. 首次启动时输入自己的 DeepSeek API Key，并选择普通版或 OCR 版。
 
-克隆项目：
+启动器会自动下载预构建镜像、启动服务并打开浏览器，不需要安装 Git、Python，也不需要编译项目。API Key 的输入内容不会显示，只会保存在解压目录的 `.env` 文件中。
+
+macOS 如果阻止首次运行，可以右键点击 `启动.command`，选择 **打开**。Windows 用户也可以右键点击 `启动.ps1`，选择 **使用 PowerShell 运行**。
+
+### 使用 Docker 命令启动
+
+适用于熟悉终端的 macOS、Windows 和 Linux 用户。请准备 Docker Desktop，或 Docker Engine 与 Compose 插件，并申请自己的 DeepSeek API Key。
+
+克隆项目并创建配置：
 
 ```bash
 git clone https://github.com/UntYEE/paper-parallel-reader.git
 cd paper-parallel-reader
-```
-
-创建本地配置：
-
-```bash
 cp .env.example .env
 ```
 
@@ -41,10 +47,11 @@ cp .env.example .env
 DEEPSEEK_API_KEY=your-api-key
 ```
 
-启动轻量版本：
+下载预构建镜像并启动轻量版本：
 
 ```bash
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
 
 浏览器打开：
@@ -66,7 +73,8 @@ docker compose down
 默认镜像不安装 Docling。需要处理扫描版或低质量 PDF 时使用 OCR 配置：
 
 ```bash
-docker compose -f compose.yaml -f compose.ocr.yaml up --build
+docker compose -f compose.yaml -f compose.ocr.yaml pull
+docker compose -f compose.yaml -f compose.ocr.yaml up -d
 ```
 
 OCR 镜像和模型较大，首次构建需要较长时间。模型会缓存在 `data/model-cache/`，后续启动可以复用。
@@ -110,13 +118,28 @@ ENABLE_OCR=true
 
 请始终保持单个 Uvicorn worker，避免 SQLite、缓存和同一论文任务发生并发写入冲突。
 
+### 从源码构建镜像
+
+开发或无法使用 GHCR 预构建镜像时，可以在本机编译基础版本：
+
+```bash
+docker compose -f compose.yaml -f compose.build.yaml up --build
+```
+
+本机构建 OCR 版本：
+
+```bash
+docker compose -f compose.yaml -f compose.ocr.yaml -f compose.build-ocr.yaml up --build
+```
+
 ### 更新、备份与清理
 
-更新并重新构建：
+使用 Release ZIP 时，下载并解压新版本，再将旧目录中的 `.env` 和 `data/` 移到新目录。使用 Git 克隆的项目时：
 
 ```bash
 git pull
-docker compose up --build
+docker compose pull
+docker compose up -d
 ```
 
 运行数据统一保存在项目的 `data/` 目录，包括 PDF、LaTeX 源码、译文、结构化资源、SQLite 数据库、检查点和 OCR 模型缓存。备份这个目录即可迁移本地数据。
@@ -135,6 +158,8 @@ MAX_UPLOAD_MB=100
 MAX_DOWNLOAD_MB=100
 PAPER_DOWNLOAD_TIMEOUT=75
 ENABLE_OCR=false
+PAPER_READER_IMAGE=ghcr.io/untyee/paper-parallel-reader:latest
+PAPER_READER_OCR_IMAGE=ghcr.io/untyee/paper-parallel-reader:ocr
 ```
 
 修改 `APP_PORT` 后，访问地址也需要使用对应端口。远程下载仅允许 HTTP/HTTPS 公网地址，并会拒绝回环、内网、链路本地、云元数据地址及跳转后的非公网地址。

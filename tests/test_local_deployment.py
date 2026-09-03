@@ -112,7 +112,31 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertIn(".env", dockerignore.splitlines())
         self.assertIn("papers_to_translate", dockerignore.splitlines())
         self.assertIn('127.0.0.1:${APP_PORT:-8000}:8000', compose)
+        self.assertIn("ghcr.io/untyee/paper-parallel-reader:latest", compose)
+        self.assertNotIn("build:", compose)
         self.assertNotIn("docling", requirements)
+
+    def test_release_bundle_and_launchers_are_configured(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        workflow = (root / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+        mac_launcher = root / "启动.command"
+        windows_launcher = root / "启动.ps1"
+        batch_launcher = root / "启动-Windows.bat"
+        self.assertTrue(mac_launcher.stat().st_mode & 0o100)
+        self.assertTrue(windows_launcher.is_file())
+        self.assertTrue(batch_launcher.is_file())
+        self.assertIn("linux/amd64,linux/arm64", workflow)
+        self.assertIn("target: runtime-ocr", workflow)
+        self.assertIn("git archive --format=zip", workflow)
+        self.assertIn('tags:\n      - "v*"', workflow)
+
+    def test_readme_contains_only_feature_and_deployment_sections(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        headings = [line for line in readme.splitlines() if line.startswith("## ")]
+        self.assertEqual(["## 功能说明", "## 部署教程"], headings)
+        self.assertIn("启动.command", readme)
+        self.assertIn("启动-Windows.bat", readme)
 
 
 class TaskStoreTests(unittest.TestCase):

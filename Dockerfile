@@ -1,5 +1,9 @@
 FROM python:3.11-slim AS dependencies
 
+LABEL org.opencontainers.image.source="https://github.com/UntYEE/paper-parallel-reader" \
+      org.opencontainers.image.description="Local parallel PDF and Chinese translation reader" \
+      org.opencontainers.image.licenses="MIT"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \

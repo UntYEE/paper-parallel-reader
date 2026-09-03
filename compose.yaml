@@ -1,8 +1,7 @@
 services:
   reader:
-    build:
-      context: .
-      target: runtime
+    image: ${PAPER_READER_IMAGE:-ghcr.io/untyee/paper-parallel-reader:latest}
+    pull_policy: always
     env_file:
       - .env
     environment:
