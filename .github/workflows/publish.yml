@@ -82,7 +82,11 @@ jobs:
               throw "A harmless Docker stderr warning was treated as a failure."
           }
 
-          $batchBytes = [System.IO.File]::ReadAllBytes((Resolve-Path ".\启动-Windows.bat"))
+          $batchPath = Get-ChildItem -File -Filter "*-Windows.bat" | Select-Object -First 1
+          if ($null -eq $batchPath) {
+              throw "The Windows batch launcher was not found."
+          }
+          $batchBytes = [System.IO.File]::ReadAllBytes($batchPath.FullName)
           $batchText = [System.Text.Encoding]::ASCII.GetString($batchBytes)
           if (-not $batchText.Contains("`r`n") -or $batchText.Replace("`r`n", "").Contains("`n")) {
               throw "The Windows batch launcher must use CRLF line endings."
