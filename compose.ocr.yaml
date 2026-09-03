@@ -1,0 +1,6 @@
+services:
+  reader:
+    build:
+      target: runtime-ocr
+    environment:
+      ENABLE_OCR: "true"

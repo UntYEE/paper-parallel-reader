@@ -1,7 +1,7 @@
 const DEFAULT_PDF = "https://arxiv.org/pdf/1706.03762";
 const DEFAULT_TRANSLATION = "./translations/attention-is-all-you-need.sample.json";
 const BACKEND_URL =
-  new URLSearchParams(window.location.search).get("backend") || "http://127.0.0.1:8787";
+  new URLSearchParams(window.location.search).get("backend") || window.location.origin;
 
 const fallbackData = {
   title: "Attention Is All You Need",
@@ -598,7 +598,7 @@ async function checkBackend() {
     const keyState = data.deepseek_api_key_configured ? "key ready" : "key missing";
     setGenerateStatus(`Backend ready, ${keyState}`, data.deepseek_api_key_configured ? "ok" : "warn");
   } catch {
-    setGenerateStatus("Backend offline: start uvicorn on :8787", "warn");
+    setGenerateStatus("Backend offline: start the local app on :8000", "warn");
   }
 }
 
@@ -896,7 +896,7 @@ generatorForm.addEventListener("submit", async (event) => {
     }
 
     const outputFile = data.output ? data.output.split("/").pop() : outputName;
-    const translationUrl = `./translations/${outputFile.endsWith(".json") ? outputFile : `${outputFile}.json`}`;
+    const translationUrl = data.translation_url || `./translations/${outputFile.endsWith(".json") ? outputFile : `${outputFile}.json`}`;
     const counts = data.status_counts || {};
     const unresolved = (counts.needs_ocr || 0) + (counts.needs_formula_recovery || 0);
     const resultSummary = unresolved
@@ -964,7 +964,7 @@ generateSavedPdfSelect.addEventListener("change", () => {
     setPaperUrl(`${BACKEND_URL}${fileUrl}`, sourceUrl || `${BACKEND_URL}${fileUrl}`);
     generateOutputInput.value = outputNameFromPdf(currentSavedPdfName);
     if (option.dataset.translationUrl) {
-      loadTranslation(option.dataset.translationUrl.replace("/viewer/", "./"));
+      loadTranslation(option.dataset.translationUrl);
       setGenerateStatus("Cached translation available", "ok");
     }
   }

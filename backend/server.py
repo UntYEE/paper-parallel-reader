@@ -7,20 +7,21 @@ import asyncio
 import concurrent.futures
 import os
 import re
-import subprocess
+import shutil
+import stat
 import tempfile
-import threading
-import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
 from urllib.parse import unquote, urlparse
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
@@ -32,17 +33,13 @@ from backend.paper_qa import (
     index_translation,
 )
 from backend.paper_search import discover_papers
+from backend.local_security import DownloadTooLargeError, UnsafeRemoteURLError, download_remote_bytes
+from backend.task_store import get_task, mark_unfinished_tasks_interrupted, now_iso, save_task, update_task
 from scripts.generate_translation_json import create_deepseek_client, generate_translation_json
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "viewer" / "translations"
-PAPERS_DIR = REPO_ROOT / "papers_to_translate"
-SOURCES_DIR = PAPERS_DIR / "latex_sources"
-INDEX_PATH = PAPERS_DIR / "paper_index.json"
-QA_DB_PATH = PAPERS_DIR / "paper_qa.sqlite3"
-PAPERS_DIR.mkdir(parents=True, exist_ok=True)
-SOURCES_DIR.mkdir(parents=True, exist_ok=True)
+VIEWER_DIR = REPO_ROOT / "viewer"
 
 
 def load_env(path: Path) -> None:
@@ -58,17 +55,100 @@ def load_env(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-load_env(REPO_ROOT / ".env")
+ENV_PATH = REPO_ROOT / ".env"
+load_env(ENV_PATH)
+
+
+def configured_path(name: str, default: Path) -> Path:
+    raw = os.getenv(name, "").strip()
+    path = Path(raw).expanduser() if raw else default
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.resolve()
+
+
+DATA_ROOT = configured_path("PAPER_DATA_DIR", REPO_ROOT / "data")
+PAPERS_DIR = DATA_ROOT
+SOURCES_DIR = DATA_ROOT / "latex_sources"
+DEFAULT_OUTPUT_DIR = DATA_ROOT / "translations"
+ASSET_DIR = DATA_ROOT / "paper-assets"
+MODEL_CACHE_DIR = configured_path("MODEL_CACHE_DIR", DATA_ROOT / "model-cache")
+INDEX_PATH = DATA_ROOT / "paper_index.json"
+QA_DB_PATH = DATA_ROOT / "paper_qa.sqlite3"
+TASK_DB_PATH = DATA_ROOT / "generation_tasks.sqlite3"
+for directory in (DATA_ROOT, SOURCES_DIR, DEFAULT_OUTPUT_DIR, ASSET_DIR, MODEL_CACHE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR / "huggingface"))
+os.environ.setdefault("TORCH_HOME", str(MODEL_CACHE_DIR / "torch"))
+
+
+def copy_missing_tree(source: Path, destination: Path) -> None:
+    if not source.exists():
+        return
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            copy_missing_tree(child, destination / child.name)
+    elif not destination.exists():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+
+def migrate_legacy_data() -> None:
+    marker = DATA_ROOT / ".legacy-data-copied-v1"
+    legacy_papers = (REPO_ROOT / "papers_to_translate").resolve()
+    if marker.exists() or DATA_ROOT == legacy_papers:
+        return
+    copy_missing_tree(legacy_papers, DATA_ROOT)
+    legacy_translations = VIEWER_DIR / "translations"
+    if legacy_translations.exists():
+        for translation in legacy_translations.glob("*.json"):
+            if translation.name != "attention-is-all-you-need.sample.json":
+                copy_missing_tree(translation, DEFAULT_OUTPUT_DIR / translation.name)
+    copy_missing_tree(VIEWER_DIR / "paper-assets", ASSET_DIR)
+    marker.write_text("Legacy data was copied without deleting its original files.\n", encoding="utf-8")
+
+
+def warn_if_env_permissions_are_broad(path: Path) -> None:
+    if os.name != "posix" or not path.exists():
+        return
+    if stat.S_IMODE(path.stat().st_mode) & 0o077:
+        print("Warning: .env is readable by other local users; consider running chmod 600 .env.", flush=True)
+
+
+migrate_legacy_data()
+warn_if_env_permissions_are_broad(ENV_PATH)
+mark_unfinished_tasks_interrupted(TASK_DB_PATH)
+
+
+def configured_origins() -> list[str]:
+    raw = os.getenv("APP_ALLOWED_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000")
+    return [item.strip().rstrip("/") for item in raw.split(",") if item.strip()]
+
+
+ALLOWED_ORIGINS = configured_origins()
 
 app = FastAPI(title="Paper Translation Backend")
 app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "[::1]", "testserver"],
+)
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def reject_cross_origin_writes(request: Request, call_next):  # noqa: ANN001
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        origin = request.headers.get("origin")
+        if origin and origin.rstrip("/") not in ALLOWED_ORIGINS:
+            return JSONResponse(status_code=403, content={"detail": "Cross-origin local API request rejected."})
+    return await call_next(request)
 
 
 def deepseek_api_key() -> str:
@@ -85,8 +165,19 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-def backend_public_url() -> str:
-    return os.getenv("PAPER_BACKEND_PUBLIC_URL", "http://127.0.0.1:8787").rstrip("/")
+def data_relative(path: Path) -> str:
+    return str(path.resolve().relative_to(DATA_ROOT))
+
+
+def storage_label(path: Path) -> str:
+    try:
+        return data_relative(path)
+    except ValueError:
+        return path.name
+
+
+def translation_file_url(path: Path) -> str:
+    return f"/viewer/translations/{safe_output_name(path.name)}"
 
 
 def safe_output_name(value: str) -> str:
@@ -207,13 +298,19 @@ def indexed_translation_path(paper_id: str) -> Optional[Path]:
     record = papers.get(paper_id, {})
     if not isinstance(record, dict):
         return None
+    translation_name = record.get("translationName")
+    if isinstance(translation_name, str) and translation_name:
+        path = (DEFAULT_OUTPUT_DIR / safe_output_name(translation_name)).resolve()
+        if path.parent == DEFAULT_OUTPUT_DIR.resolve() and path.exists():
+            return path
     translation = record.get("translationPath")
-    if not isinstance(translation, str):
+    if not isinstance(translation, str) or not translation:
         return None
-    path = (REPO_ROOT / translation).resolve()
-    if path.parent != DEFAULT_OUTPUT_DIR.resolve():
-        return None
-    return path if path.exists() else None
+    candidates = [(DATA_ROOT / translation).resolve(), (REPO_ROOT / translation).resolve()]
+    for path in candidates:
+        if path.parent in {DEFAULT_OUTPUT_DIR.resolve(), (VIEWER_DIR / "translations").resolve()} and path.exists():
+            return path
+    return None
 
 
 def ensure_qa_index(paper_id: str) -> tuple[Path, dict[str, object]]:
@@ -254,27 +351,18 @@ class GenerationTaskRequest(BaseModel):
     force: bool = False
 
 
-GENERATION_TASKS: dict[str, dict[str, object]] = {}
-GENERATION_TASKS_LOCK = threading.Lock()
 GENERATION_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="paper-generation")
 
 
 def update_generation_task(task_id: str, **fields: object) -> None:
-    with GENERATION_TASKS_LOCK:
-        task = GENERATION_TASKS.get(task_id)
-        if not task:
-            return
-        task.update(fields)
-        task["revision"] = int(task.get("revision", 0)) + 1
-        task["updatedAt"] = datetime.now(timezone.utc).isoformat()
+    update_task(TASK_DB_PATH, task_id, **fields)
 
 
 def public_generation_task(task_id: str) -> dict[str, object]:
-    with GENERATION_TASKS_LOCK:
-        task = GENERATION_TASKS.get(task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Generation task not found.")
-        return dict(task)
+    task = get_task(TASK_DB_PATH, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Generation task not found.")
+    return task
 
 
 def safe_pdf_name(value: str) -> str:
@@ -312,7 +400,7 @@ def paper_file_url(name: str) -> str:
 
 
 def paper_viewer_url(name: str) -> str:
-    return f"{backend_public_url()}{paper_file_url(name)}"
+    return paper_file_url(name)
 
 
 def infer_title_from_pdf(path: Path) -> str:
@@ -440,7 +528,7 @@ def write_paper_meta(path: Path, source_url: str, title: str = "") -> None:
     upsert_paper_index(
         paper_id,
         pdfName=path.name,
-        pdfPath=str(path.relative_to(REPO_ROOT)),
+        pdfPath=data_relative(path),
         sourceUrl=source_url,
         title=meta["title"],
     )
@@ -475,8 +563,23 @@ def json_loads(value: str) -> dict[str, str]:
     return data if isinstance(data, dict) else {}
 
 
+async def read_upload_limited(upload: UploadFile) -> bytes:
+    max_bytes = env_int("MAX_UPLOAD_MB", 100) * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Upload exceeds the {env_int('MAX_UPLOAD_MB', 100)} MB limit.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def write_upload(upload: UploadFile, suffix: str) -> Path:
-    data = await upload.read()
+    data = await read_upload_limited(upload)
     if not data:
         raise HTTPException(status_code=400, detail=f"{upload.filename or 'upload'} is empty.")
     handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -487,7 +590,7 @@ async def write_upload(upload: UploadFile, suffix: str) -> Path:
 
 
 async def save_uploaded_pdf(upload: UploadFile, source_url: str, fallback_name: str) -> Path:
-    data = await upload.read()
+    data = await read_upload_limited(upload)
     if not data:
         raise HTTPException(status_code=400, detail=f"{upload.filename or 'PDF upload'} is empty.")
     if not data.startswith(b"%PDF"):
@@ -495,7 +598,7 @@ async def save_uploaded_pdf(upload: UploadFile, source_url: str, fallback_name: 
 
     filename = safe_pdf_name(upload.filename or fallback_name)
     path = paper_path(filename)
-    path.write_bytes(data)
+    atomic_write_bytes(path, data)
     write_paper_meta(path, source_url)
     return path
 
@@ -527,7 +630,7 @@ def list_papers() -> dict[str, object]:
             {
                 **info,
                 "translationUrl": (
-                    f"/viewer/translations/{cached_translation.name}" if cached_translation else ""
+                    translation_file_url(cached_translation) if cached_translation else ""
                 ),
             }
         )
@@ -591,85 +694,21 @@ def check_paper_cache(url: Annotated[str, Form()]) -> JSONResponse:
 
 
 def download_pdf_bytes(url: str) -> bytes:
-    curl_command = [
-        "curl",
-        "-L",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--retry",
-        "2",
-        "--retry-all-errors",
-        "--retry-delay",
-        "2",
-        "--connect-timeout",
-        "20",
-        "--max-time",
-        "75",
-        "-A",
-        "Mozilla/5.0 paper-reading-workflow/1.0",
+    return download_remote_bytes(
         url,
-    ]
-    try:
-        completed = subprocess.run(curl_command, check=True, capture_output=True)
-        return completed.stdout
-    except Exception as curl_error:
-        curl_failure = curl_error
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/pdf,*/*",
-            "User-Agent": "Mozilla/5.0 paper-reading-workflow/1.0",
-        },
+        accept="application/pdf,*/*",
+        max_bytes=env_int("MAX_DOWNLOAD_MB", 100) * 1024 * 1024,
+        timeout=float(os.getenv("PAPER_DOWNLOAD_TIMEOUT", "75")),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read()
-    except Exception as urllib_error:
-        raise RuntimeError(f"curl failed: {curl_failure}; urllib fallback failed: {urllib_error}") from urllib_error
 
 
 def download_binary_bytes(url: str, *, accept: str, max_time: str = "75") -> bytes:
-    curl_command = [
-        "curl",
-        "-L",
-        "--fail",
-        "--silent",
-        "--show-error",
-        "--retry",
-        "2",
-        "--retry-all-errors",
-        "--retry-delay",
-        "2",
-        "--connect-timeout",
-        "20",
-        "--max-time",
-        max_time,
-        "-H",
-        f"Accept: {accept}",
-        "-A",
-        "Mozilla/5.0 paper-reading-workflow/1.0",
+    return download_remote_bytes(
         url,
-    ]
-    try:
-        completed = subprocess.run(curl_command, check=True, capture_output=True)
-        return completed.stdout
-    except Exception as curl_error:
-        curl_failure = curl_error
-
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": accept,
-            "User-Agent": "Mozilla/5.0 paper-reading-workflow/1.0",
-        },
+        accept=accept,
+        max_bytes=env_int("MAX_DOWNLOAD_MB", 100) * 1024 * 1024,
+        timeout=float(max_time),
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.read()
-    except Exception as urllib_error:
-        raise RuntimeError(f"curl failed: {curl_failure}; urllib fallback failed: {urllib_error}") from urllib_error
 
 
 def ensure_arxiv_latex_source(arxiv_id: str) -> Path:
@@ -702,6 +741,10 @@ def download_paper(url: Annotated[str, Form()]) -> JSONResponse:
 
     try:
         data = download_pdf_bytes(url)
+    except DownloadTooLargeError as error:
+        raise HTTPException(status_code=413, detail=f"PDF download rejected: {error}") from error
+    except UnsafeRemoteURLError as error:
+        raise HTTPException(status_code=400, detail=f"PDF URL rejected: {error}") from error
     except Exception as error:  # noqa: BLE001 - report download failures clearly to the UI.
         raise HTTPException(status_code=400, detail=f"Failed to download PDF: {error}") from error
 
@@ -770,10 +813,10 @@ def run_generation_task(task_id: str, request: GenerationTaskRequest) -> None:
             paper_id,
             pdfName=pdf_path.name,
             sourceUrl=request.paperUrl,
-            pdfPath=str(pdf_path.relative_to(REPO_ROOT)),
-            translationPath=str(output_path.relative_to(REPO_ROOT)),
+            pdfPath=data_relative(pdf_path),
+            translationPath=data_relative(output_path),
             translationName=output_path.name,
-            sourcePath=str(latex_path.relative_to(REPO_ROOT)) if latex_path else "",
+            sourcePath=data_relative(latex_path) if latex_path else "",
             sourceMode=result.get("extractionMethod", "latex" if latex_path else "pdf"),
             sections=len(result["sections"]),
             paragraphs=paragraph_count,
@@ -788,7 +831,8 @@ def run_generation_task(task_id: str, request: GenerationTaskRequest) -> None:
             progress=result.get("translationProgress", {}),
             result={
                 "paperId": paper_id,
-                "output": str(output_path.relative_to(REPO_ROOT)),
+                "output": data_relative(output_path),
+                "translationUrl": translation_file_url(output_path),
                 "pdfUrl": local_pdf_url,
                 "sections": len(result["sections"]),
                 "paragraphs": paragraph_count,
@@ -807,22 +851,21 @@ def create_generation_task(request: GenerationTaskRequest) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Set DEEPSEEK_API_KEY before generating.")
     task_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
-    with GENERATION_TASKS_LOCK:
-        GENERATION_TASKS[task_id] = {
-            "taskId": task_id,
+    save_task(TASK_DB_PATH, {
+        "taskId": task_id,
+        "status": "queued",
+        "revision": 0,
+        "createdAt": now,
+        "updatedAt": now,
+        "progress": {
             "status": "queued",
-            "revision": 0,
-            "createdAt": now,
-            "updatedAt": now,
-            "progress": {
-                "status": "queued",
-                "completedBatches": 0,
-                "totalBatches": 0,
-                "retryCount": 0,
-                "totalTokens": 0,
-                "estimatedCostUsd": 0,
-            },
-        }
+            "completedBatches": 0,
+            "totalBatches": 0,
+            "retryCount": 0,
+            "totalTokens": 0,
+            "estimatedCostUsd": 0,
+        },
+    })
     GENERATION_EXECUTOR.submit(run_generation_task, task_id, request)
     return public_generation_task(task_id)
 
@@ -844,7 +887,7 @@ async def generation_task_events(task_id: str) -> StreamingResponse:
             if current_revision != revision:
                 revision = current_revision
                 yield f"data: {json_event_dumps(task)}\n\n"
-            if task.get("status") in {"completed", "failed"}:
+            if task.get("status") in {"completed", "failed", "interrupted"}:
                 break
             await asyncio.sleep(0.5)
 
@@ -907,13 +950,14 @@ async def generate(
 
         cached_path = indexed_translation_path(paper_id)
         if source_mode != "latex" and not force and not dry_run and cached_path:
-            print(f"Cache hit for {paper_id}: {cached_path.relative_to(REPO_ROOT)}", flush=True)
+            print(f"Cache hit for {paper_id}: {storage_label(cached_path)}", flush=True)
             return JSONResponse(
                 {
                     "ok": True,
                     "cached": True,
                     "paperId": paper_id,
-                    "output": str(cached_path.relative_to(REPO_ROOT)),
+                    "output": storage_label(cached_path),
+                    "translation_url": translation_file_url(cached_path),
                     "pdf_url": local_pdf_url,
                     "pdf_name": pdf_path.name if pdf_path else "",
                     "file_url": paper_file_url(pdf_path.name) if pdf_path else "",
@@ -928,17 +972,18 @@ async def generate(
                 paper_id,
                 pdfName=saved_pdf or "",
                 sourceUrl=paper_url,
-                pdfPath=str(pdf_path.relative_to(REPO_ROOT)) if pdf_path else "",
-                translationPath=str(output_path.relative_to(REPO_ROOT)),
+                pdfPath=data_relative(pdf_path) if pdf_path else "",
+                translationPath=data_relative(output_path),
                 translationName=output_path.name,
             )
-            print(f"Output cache hit for {paper_id}: {output_path.relative_to(REPO_ROOT)}", flush=True)
+            print(f"Output cache hit for {paper_id}: {data_relative(output_path)}", flush=True)
             return JSONResponse(
                 {
                     "ok": True,
                     "cached": True,
                     "paperId": paper_id,
-                    "output": str(output_path.relative_to(REPO_ROOT)),
+                    "output": data_relative(output_path),
+                    "translation_url": translation_file_url(output_path),
                     "pdf_url": local_pdf_url,
                     "pdf_name": pdf_path.name if pdf_path else "",
                     "file_url": paper_file_url(pdf_path.name) if pdf_path else "",
@@ -962,7 +1007,7 @@ async def generate(
                     latex_path = await run_in_threadpool(ensure_arxiv_latex_source, arxiv_id)
                     upsert_paper_index(
                         paper_id,
-                        sourcePath=str(latex_path.relative_to(REPO_ROOT)),
+                        sourcePath=data_relative(latex_path),
                         sourceMode="latex",
                     )
                 except Exception as error:  # noqa: BLE001 - auto should fall back, latex should report.
@@ -1007,7 +1052,7 @@ async def generate(
         paragraph_count = sum(len(section["paragraphs"]) for section in result["sections"])
         status_counts = result.get("statusCounts", {})
         print(
-            f"Generated {output_path.relative_to(REPO_ROOT)} "
+            f"Generated {data_relative(output_path)} "
             f"({len(result['sections'])} sections, {paragraph_count} paragraphs)",
             flush=True,
         )
@@ -1016,10 +1061,10 @@ async def generate(
                 paper_id,
                 pdfName=pdf_path.name if pdf_path else "",
                 sourceUrl=paper_url,
-                pdfPath=str(pdf_path.relative_to(REPO_ROOT)) if pdf_path else "",
-                translationPath=str(output_path.relative_to(REPO_ROOT)),
+                pdfPath=data_relative(pdf_path) if pdf_path else "",
+                translationPath=data_relative(output_path),
                 translationName=output_path.name,
-                sourcePath=str(latex_path.relative_to(REPO_ROOT)) if latex_path else "",
+                sourcePath=data_relative(latex_path) if latex_path else "",
                 sourceMode=result.get("extractionMethod", "latex" if latex_path else "pdf"),
                 sections=len(result["sections"]),
                 paragraphs=paragraph_count,
@@ -1033,7 +1078,8 @@ async def generate(
                 "ok": True,
                 "cached": False,
                 "paperId": paper_id,
-                "output": str(output_path.relative_to(REPO_ROOT)),
+                "output": data_relative(output_path),
+                "translation_url": translation_file_url(output_path),
                 "pdf_url": local_pdf_url,
                 "pdf_name": pdf_path.name if pdf_path else "",
                 "file_url": paper_file_url(pdf_path.name) if pdf_path else "",
@@ -1096,7 +1142,33 @@ def delete_paper_chat_history(paper_id: str, session_id: str) -> dict[str, objec
     return {"ok": True, "paperId": paper_id}
 
 
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/viewer/")
+
+
+@app.get("/viewer/translations/{filename}", include_in_schema=False)
+def serve_translation(filename: str) -> FileResponse:
+    safe_name = safe_output_name(filename)
+    candidates = [DEFAULT_OUTPUT_DIR / safe_name, VIEWER_DIR / "translations" / safe_name]
+    for path in candidates:
+        resolved = path.resolve()
+        if resolved.parent == path.parent.resolve() and resolved.exists():
+            return FileResponse(resolved, media_type="application/json")
+    raise HTTPException(status_code=404, detail="Translation not found.")
+
+
+app.mount("/viewer/paper-assets", StaticFiles(directory=ASSET_DIR), name="paper-assets")
+app.mount("/viewer", StaticFiles(directory=VIEWER_DIR, html=True), name="viewer")
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("backend.server:app", host="127.0.0.1", port=8787, reload=False)
+    uvicorn.run(
+        "backend.server:app",
+        host=os.getenv("APP_HOST", "127.0.0.1"),
+        port=env_int("APP_PORT", 8000),
+        reload=False,
+        workers=1,
+    )

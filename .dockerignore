@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.venv
+venv
+data
+papers_to_translate
+__pycache__
+*.py[cod]
+*.log
+.DS_Store
+.cache
+.pytest_cache
+README 2.md
+viewer/paper-assets
+viewer/translations/*.json
+!viewer/translations/attention-is-all-you-need.sample.json

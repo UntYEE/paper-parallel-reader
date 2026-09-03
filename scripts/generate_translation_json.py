@@ -451,6 +451,8 @@ def extract_pdf_pages_docling(
     force_ocr: bool,
     enrich_formulas: bool = False,
 ) -> list[tuple[int, str]]:
+    if os.getenv("ENABLE_OCR", "false").strip().lower() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("Docling OCR is disabled. Restart with ENABLE_OCR=true to enable it.")
     try:
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import OcrAutoOptions, PdfPipelineOptions
@@ -2361,6 +2363,10 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def source_display_name(path: Path) -> str:
+    return path.name
+
+
 def bounded_parallelism(value: int, chunk_count: int) -> int:
     return max(1, min(value, chunk_count, 8))
 
@@ -2394,7 +2400,7 @@ def generate_translation_json(
 
     if text:
         extracted_pages = extract_text_pages(text)
-        source_name = str(text)
+        source_name = source_display_name(text)
         extraction_method = "text"
     elif latex:
         try:
@@ -2403,7 +2409,7 @@ def generate_translation_json(
             log_extraction_quality("latex", latex_summary)
             if extraction_is_usable(latex_summary) or not pdf:
                 extracted_pages = latex_pages
-                source_name = str(latex)
+                source_name = source_display_name(latex)
                 extraction_method = "latex"
             else:
                 print("LaTeX extraction is incomplete; falling back to PDF.", file=sys.stderr, flush=True)
@@ -2417,7 +2423,7 @@ def generate_translation_json(
         extracted_pages, extraction_ocr_pages = extract_pdf_pages_adaptive(pdf, pages, pdf_extractor)
         native_summary = extraction_quality_summary(extracted_pages)
         log_extraction_quality("pdf-native", native_summary)
-        source_name = str(pdf)
+        source_name = source_display_name(pdf)
         extraction_method = "pdf-native+docling-ocr" if extraction_ocr_pages else "pdf-native"
 
         if not extraction_is_usable(native_summary):
@@ -2484,7 +2490,10 @@ def generate_translation_json(
         paper_fingerprint = hashlib.sha256(
             json.dumps(fingerprint_data, ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()
-        checkpoint_path = Path(__file__).resolve().parents[1] / "papers_to_translate" / "checkpoints" / (
+        data_root = Path(
+            os.getenv("PAPER_DATA_DIR", str(Path(__file__).resolve().parents[1] / "data"))
+        ).expanduser().resolve()
+        checkpoint_path = data_root / "checkpoints" / (
             f"{output.stem}-{paper_fingerprint[:16]}.json"
         )
         if not resume:

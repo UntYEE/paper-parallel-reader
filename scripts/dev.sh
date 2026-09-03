@@ -4,9 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
-BACKEND_PORT="${BACKEND_PORT:-8787}"
-FRONTEND_PORT="${FRONTEND_PORT:-8000}"
+APP_HOST="${APP_HOST:-127.0.0.1}"
+APP_PORT="${APP_PORT:-8000}"
+export PAPER_DATA_DIR="${PAPER_DATA_DIR:-$ROOT_DIR/data}"
+export ENABLE_OCR="${ENABLE_OCR:-false}"
 
 if [ -x ".venv/bin/python" ]; then
   PYTHON=".venv/bin/python"
@@ -16,30 +17,16 @@ fi
 
 if [ ! -f ".env" ]; then
   cp .env.example .env
+  chmod 600 .env 2>/dev/null || true
   echo "[dev] Created .env from .env.example. Fill DEEPSEEK_API_KEY before real generation."
 fi
 
-cleanup() {
-  echo
-  echo "[dev] Stopping frontend/backend..."
-  kill "${BACKEND_PID:-}" "${FRONTEND_PID:-}" 2>/dev/null || true
-  wait "${BACKEND_PID:-}" "${FRONTEND_PID:-}" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-
-echo "[dev] Backend:  http://${BACKEND_HOST}:${BACKEND_PORT}"
-echo "[dev] Frontend: http://localhost:${FRONTEND_PORT}/viewer/"
-echo "[dev] Logs from both processes will appear below. Press Ctrl+C to stop."
+echo "[dev] Reader: http://${APP_HOST}:${APP_PORT}/viewer/"
+echo "[dev] Data:   ${PAPER_DATA_DIR}"
+echo "[dev] Press Ctrl+C to stop."
 echo
 
-PYTHONUNBUFFERED=1 "$PYTHON" -m uvicorn backend.server:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" &
-BACKEND_PID=$!
-
-"$PYTHON" -m http.server "$FRONTEND_PORT" &
-FRONTEND_PID=$!
-
-while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
-  sleep 1
-done
-
-echo "[dev] One process exited; shutting down the other."
+exec env PYTHONUNBUFFERED=1 "$PYTHON" -m uvicorn backend.server:app \
+  --host "$APP_HOST" \
+  --port "$APP_PORT" \
+  --workers 1

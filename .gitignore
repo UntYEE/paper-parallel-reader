@@ -5,6 +5,9 @@ venv/
 __pycache__/
 *.py[cod]
 *.log
+data/
+.cache/
+.pytest_cache/
 
 # Local paper/source cache and generated index.
 papers_to_translate/paper_qa.sqlite3
