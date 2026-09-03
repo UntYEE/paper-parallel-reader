@@ -2,34 +2,45 @@
 Set-StrictMode -Version Latest
 Set-Location $PSScriptRoot
 
+function Invoke-DockerProbe {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell can promote harmless native stderr warnings to exceptions.
+        $ErrorActionPreference = "Continue"
+        $null = & docker @Arguments 2>&1
+        return $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+}
+
 try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw "没有找到 Docker。请先安装 Docker Desktop：https://www.docker.com/products/docker-desktop/"
     }
 
-    & docker compose version *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-DockerProbe -Arguments @("compose", "version")) -ne 0) {
         throw "当前 Docker 没有 Compose 插件，请更新 Docker Desktop。"
     }
 
-    & docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-DockerProbe -Arguments @("info")) -ne 0) {
         $dockerDesktop = Join-Path $Env:ProgramFiles "Docker\Docker\Docker Desktop.exe"
         if (Test-Path $dockerDesktop) {
             Write-Host "正在启动 Docker Desktop..."
             Start-Process $dockerDesktop
             for ($attempt = 0; $attempt -lt 60; $attempt++) {
                 Start-Sleep -Seconds 2
-                & docker info *> $null
-                if ($LASTEXITCODE -eq 0) {
+                if ((Invoke-DockerProbe -Arguments @("info")) -eq 0) {
                     break
                 }
             }
         }
     }
 
-    & docker info *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if ((Invoke-DockerProbe -Arguments @("info")) -ne 0) {
         throw "Docker Desktop 尚未就绪，请确认它已经完成启动。"
     }
 

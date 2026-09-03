@@ -126,6 +126,10 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertTrue(windows_launcher.is_file())
         self.assertTrue(batch_launcher.is_file())
         self.assertTrue(windows_launcher.read_bytes().startswith(b"\xef\xbb\xbf"))
+        windows_script = windows_launcher.read_text(encoding="utf-8-sig")
+        self.assertIn("function Invoke-DockerProbe", windows_script)
+        self.assertIn("return $LASTEXITCODE", windows_script)
+        self.assertNotIn("docker info *> $null", windows_script)
         batch_bytes = batch_launcher.read_bytes()
         self.assertEqual(batch_bytes, batch_bytes.decode("ascii").encode("ascii"))
         self.assertIn(b"\r\n", batch_bytes)
@@ -138,6 +142,9 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertIn("docker buildx imagetools create", workflow)
         self.assertIn("git archive --format=zip", workflow)
         self.assertIn("sha256sum", workflow)
+        self.assertIn("test-windows-launcher:", workflow)
+        self.assertIn("windows-latest", workflow)
+        self.assertIn("daemon is not using the default seccomp profile", workflow)
         self.assertIn('tags:\n      - "v*"', workflow)
 
     def test_readme_contains_only_feature_and_deployment_sections(self) -> None:

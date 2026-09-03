@@ -43,8 +43,55 @@ jobs:
           docker compose -f compose.yaml -f compose.build.yaml config --quiet
           docker compose -f compose.yaml -f compose.ocr.yaml -f compose.build-ocr.yaml config --quiet
 
+  test-windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate Windows launchers
+        shell: powershell
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path ".\start.ps1"),
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+          if ($parseErrors.Count -gt 0) {
+              $parseErrors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }
+
+          $probeFunction = $ast.Find({
+              param($node)
+              $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                  $node.Name -eq "Invoke-DockerProbe"
+          }, $true)
+          if ($null -eq $probeFunction) {
+              throw "Invoke-DockerProbe was not found."
+          }
+          Invoke-Expression $probeFunction.Extent.Text
+
+          function docker {
+              Write-Error "WARNING: daemon is not using the default seccomp profile" -ErrorAction Continue
+              $global:LASTEXITCODE = 0
+          }
+          if ((Invoke-DockerProbe -Arguments @("info")) -ne 0) {
+              throw "A harmless Docker stderr warning was treated as a failure."
+          }
+
+          $batchBytes = [System.IO.File]::ReadAllBytes((Resolve-Path ".\启动-Windows.bat"))
+          $batchText = [System.Text.Encoding]::ASCII.GetString($batchBytes)
+          if (-not $batchText.Contains("`r`n") -or $batchText.Replace("`r`n", "").Contains("`n")) {
+              throw "The Windows batch launcher must use CRLF line endings."
+          }
+
   build:
-    needs: test
+    needs:
+      - test
+      - test-windows-launcher
     permissions:
       contents: read
       packages: write
@@ -154,6 +201,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
       - test
+      - test-windows-launcher
       - publish
     runs-on: ubuntu-latest
     permissions:
