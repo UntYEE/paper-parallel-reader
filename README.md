@@ -10,11 +10,15 @@
 - 支持论文标题、关键词、arXiv ID、PDF 直链和本地 PDF 上传。
 - 自动识别标题与论文信息，并缓存 PDF、LaTeX 源码和生成结果。
 - arXiv 论文优先解析 LaTeX 源码；结构不完整时自动回退到 PDF 文本提取。
+- 没有 LaTeX 源码的期刊 PDF（化学、材料、生物医学、中文期刊等）按版式切分章节：用字号、加粗和页面位置推断标题，识别 Introduction、Experimental Section、Results and Discussion 等无编号标题与中英文标题；按分栏顺序阅读，自动过滤页眉页脚、DOI、期刊页脚、表格列与图片坐标文字；跨页段落自动合并并标注页码范围。
 - 通过 DeepSeek 并行翻译，支持动态分块、失败缩批重试和中断续跑。
 - 保留 LaTeX 公式、章节引用和文献引用，使用 Markdown 与 KaTeX 渲染译文。
 - 将正文引用的图片、表格和算法提取为可折叠的结构化内容。
 - 可选使用 Docling，只对低质量页面或缺失公式的区域进行 OCR。
 - 内置论文问答，基于本地 SQLite FTS5 检索原文和译文，并校验回答引用的证据段落。
+- 检索同时走 arXiv、Crossref、OpenAlex、Semantic Scholar 与 DeepSeek 网页搜索，结果按查询缓存 7 天（可清空），重复检索不再重复联网计费；同一篇论文的多来源结果按 DOI/arXiv 号自动去重。
+- 「生成设置」里可以查看本地缓存占用与检索缓存命中，并删除某篇论文的 PDF、译文、图片、检查点和问答索引。
+- 缓存译文记录生成版本：章节切分逻辑升级后会提示「结构可更新」，勾选「强制重新生成」即可按新结构重建。
 - 支持专注译文、紧凑排版、深色主题和浏览器 PDF 阅读器的原生工具。
 - 所有论文、译文、问答记录和检查点默认只保存在使用者自己的电脑上。
 
@@ -183,9 +187,16 @@ APP_PORT=8000
 MAX_UPLOAD_MB=100
 MAX_DOWNLOAD_MB=100
 PAPER_DOWNLOAD_TIMEOUT=75
+PAPER_SEARCH_CACHE_TTL_HOURS=168
+PAPER_SEARCH_API_TIMEOUT=20
+PAPER_SEARCH_RESPONSE_MB=8
+PAPER_SEARCH_VERIFY_LIMIT=6
+PAPER_SEARCH_CONTACT_EMAIL=
 ENABLE_OCR=false
 PAPER_READER_IMAGE=ghcr.io/untyee/paper-parallel-reader:latest
 PAPER_READER_OCR_IMAGE=ghcr.io/untyee/paper-parallel-reader:ocr
 ```
 
-修改 `APP_PORT` 后，访问地址也需要使用对应端口。远程下载仅允许 HTTP/HTTPS 公网地址，并会拒绝回环、内网、链路本地、云元数据地址及跳转后的非公网地址。
+修改 `APP_PORT` 后，访问地址也需要使用对应端口。远程下载仅允许公网 HTTP/HTTPS 地址，并会拒绝回环、内网、链路本地、云元数据地址及跳转后的非公网地址。
+
+`PAPER_SEARCH_CACHE_TTL_HOURS=0` 可关闭检索缓存；`PAPER_SEARCH_VERIFY_LIMIT` 控制每次检索实际校验的开放 PDF 链接数量；填写 `PAPER_SEARCH_CONTACT_EMAIL`（自己的邮箱）后会启用 Unpaywall 开放 PDF 查询。检索缓存、单篇论文缓存和占用统计都可以在页面「生成设置」里管理。

@@ -40,13 +40,257 @@ PAGE_ARTIFACT_RE = re.compile(
     re.IGNORECASE,
 )
 PAGE_HEADER_RE = re.compile(r"^[A-Z][A-Za-z0-9 ,:;'-]{20,}\s+\d+$")
-CAPTION_RE = re.compile(r"^(figure|table)\s+\d+\s*[:.]", re.IGNORECASE)
-INLINE_CAPTION_RE = re.compile(r"(figure|table)\s+\d+\s*[:.]", re.IGNORECASE)
-STOP_SECTION_RE = re.compile(
-    r"^(?:[1-9][0-9]?(?:\.[0-9]+)*\.?\s+)?"
-    r"(references|bibliography|acknowledg(?:e)?ments?|appendix)\b",
+CAPTION_RE = re.compile(
+    r"^(?:(?:figure|table|scheme|chart)\s+\d+\s*[:.]|(?:fig|tab)\.?\s*\d+\s*[:.]|(?:图|表|式)\s*\d+)",
     re.IGNORECASE,
 )
+INLINE_CAPTION_RE = re.compile(
+    r"(?:(?:figure|table|scheme|chart)\s+\d+\s*[:.]|(?:图|表)\s*\d+)",
+    re.IGNORECASE,
+)
+# Section names for journals that print headings without any numbering. The list carries the
+# common English names plus the CJK, German, French, and Spanish equivalents, because PDF-only
+# literature is dominated by those languages.
+JOURNAL_SECTION_NAMES = (
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "related works",
+    "literature review",
+    "theory",
+    "theoretical background",
+    "materials and methods",
+    "material and methods",
+    "methods",
+    "method",
+    "methodology",
+    "experimental",
+    "experimental section",
+    "experimental procedures",
+    "experimental methods",
+    "experimental details",
+    "computational details",
+    "results",
+    "results and discussion",
+    "results and conclusions",
+    "discussion",
+    "conclusions",
+    "conclusion",
+    "concluding remarks",
+    "conclusion and outlook",
+    "future work",
+    "outlook",
+    "acknowledgment",
+    "acknowledgments",
+    "acknowledgement",
+    "acknowledgements",
+    "references",
+    "bibliography",
+    "notes and references",
+    "appendix",
+    "appendices",
+    "supporting information",
+    "supplementary information",
+    "supplementary material",
+    "supporting material",
+    "author contributions",
+    "conflicts of interest",
+    "conflict of interest",
+    "competing interests",
+    "declaration of competing interest",
+    "data availability",
+    "data availability statement",
+    "funding",
+    "abbreviations",
+    # Chinese
+    "摘要",
+    "引言",
+    "绪论",
+    "前言",
+    "研究背景",
+    "相关工作",
+    "文献综述",
+    "理论基础",
+    "材料与方法",
+    "材料和方法",
+    "方法",
+    "方法学",
+    "研究方法",
+    "实验",
+    "实验部分",
+    "实验方法",
+    "实验材料",
+    "结果",
+    "结果与分析",
+    "结果与讨论",
+    "结果和讨论",
+    "讨论",
+    "结论",
+    "结论与展望",
+    "总结",
+    "展望",
+    "致谢",
+    "参考文献",
+    "引用文献",
+    "附录",
+    "支持信息",
+    "补充材料",
+    "作者贡献",
+    "利益冲突",
+    "数据可用性",
+    "基金项目",
+    # German / French / Spanish
+    "zusammenfassung",
+    "einleitung",
+    "hintergrund",
+    "methoden",
+    "ergebnisse",
+    "diskussion",
+    "schlussfolgerung",
+    "danksagung",
+    "literaturverzeichnis",
+    "introduction générale",
+    "méthodes",
+    "méthodologie",
+    "résultats",
+    "discussion",
+    "conclusion",
+    "remerciements",
+    "références",
+    "introducción",
+    "métodos",
+    "resultados",
+    "discusión",
+    "conclusión",
+    "agradecimientos",
+    "referencias",
+)
+# Numbering styles: "1.2", "I.", "A.", "§3", "第1章", "一、", "（二）", "2" (CJK headings often
+# separate the number from the title with a space).
+SECTION_NUMBER_PATTERN = (
+    r"(?:第\s*[0-9一二三四五六七八九十]+\s*[章节節部篇]"
+    r"|§\s*[0-9]+(?:\.[0-9]+)*"
+    r"|[0-9]+(?:\.[0-9]+)*"
+    r"|[IVXLC]+"
+    r"|[A-Z]"
+    r"|[一二三四五六七八九十]+"
+    r"|[（(][0-9一二三四五六七八九十]+[)）])"
+    r"[.)、．]?\s*"
+)
+BARE_SECTION_NUMBER_RE = re.compile(
+    r"^(?:[0-9]+(?:\.[0-9]+)*|[IVXLC]+|[A-Z]|[一二三四五六七八九十]+)[.)、．]?$"
+)
+STOP_SECTION_NAMES = (
+    "references",
+    "reference list",
+    "references cited",
+    "literature cited",
+    "works cited",
+    "bibliography",
+    "notes and references",
+    "acknowledgment",
+    "acknowledgments",
+    "acknowledgement",
+    "acknowledgements",
+    "appendix",
+    "appendices",
+    "supporting information",
+    "supplementary information",
+    "supplementary material",
+    "conflicts of interest",
+    "conflict of interest",
+    "declaration of competing interest",
+    "author contributions",
+    "credit authorship contribution statement",
+    "data availability",
+    "data availability statement",
+    "参考文献",
+    "引用文献",
+    "致谢",
+    "附录",
+    "支持信息",
+    "补充材料",
+    "作者贡献",
+    "利益冲突",
+    "数据可用性",
+    "literaturverzeichnis",
+    "danksagung",
+    "anhang",
+    "références",
+    "remerciements",
+    "annexe",
+    "referencias",
+    "agradecimientos",
+    "apéndice",
+)
+ABSTRACT_LABELS = ("abstract", "摘要", "概要", "内容提要", "zusammenfassung", "r\u00e9sum\u00e9", "resumen")
+KEYWORD_LABELS = ("keyword", "key word", "关键词", "关键字", "schlüsselwörter", "mots-clés", "palabras clave")
+STOP_SECTION_RE = re.compile(
+    r"^(?:" + SECTION_NUMBER_PATTERN + r")?"
+    r"(?P<name>"
+    + "|".join(re.escape(name) for name in sorted(STOP_SECTION_NAMES, key=len, reverse=True))
+    + r")\s*[:.]?$",
+    re.IGNORECASE,
+)
+# Journals outside CS/ML usually print unnumbered headings ("Introduction", "Experimental
+# Section", "Results and Discussion", ...). Accept them as headings, optionally prefixed by a
+# number, a Roman numeral, or a single letter label.
+SECTION_NAME_HEADING_RE = re.compile(
+    r"^(?:" + SECTION_NUMBER_PATTERN + r")?"
+    r"(?P<name>"
+    + "|".join(re.escape(name) for name in sorted(JOURNAL_SECTION_NAMES, key=len, reverse=True))
+    + r")\s*[:.]?$",
+    re.IGNORECASE,
+)
+ABSTRACT_HEADING_RE = re.compile(
+    r"^\s*a\s*b\s*s\s*t\s*r\s*a\s*c\s*t\b\s*[:：—–-]?\s*(.*)$",
+    re.IGNORECASE,
+)
+KEYWORDS_LINE_RE = re.compile(
+    r"^\s*(?:"
+    + "|".join(re.escape(label) for label in sorted(KEYWORD_LABELS, key=len, reverse=True))
+    + r")\s*[:：]?\s*(.*)$",
+    re.IGNORECASE,
+)
+# Page furniture that journals repeat on every page: DOIs, footers, download stamps, and the
+# "Journal Name 2015, 80, 1234-1240" style running head.
+TEXT_FURNITURE_RE = re.compile(
+    r"(?:doi\s*:|https?://|dx\.doi\.org|downloaded\s+(?:from|by)|all\s+rights\s+reserved|"
+    r"©|copyright|supporting\s+information|page\s+\d+\s+of\s+\d+|"
+    r"\bvol\.?\s*\d+|\bissue\s+\d+|\bed\.\s*\d+|\bno\.\s*\d+|crossmark|open\s+access|"
+    r"author\s+manuscript|advance\s+article|just\s+accepted|published\s+(?:online|on|as)\b|"
+    r"received\s+\d|accepted\s+\d|submitted\s+\d)",
+    re.IGNORECASE,
+)
+PUBLICATION_HEADER_RE = re.compile(
+    r"(?:\b(?:19|20)\d{2}\s*,\s*\d+\s*,\s*\d+)"
+    r"|(?:\b(?:19|20)\d{2}\b[^\n]{0,40}?\b\d+\s*[–—-]\s*\d+)"
+    r"|(?:\(\s*(?:19|20)\d{2}\s*\)\s*\d+\s*(?:e|–|—|-)\s*\d+)",
+    re.IGNORECASE,
+)
+# Author affiliations and reference-like lines are printed with running numbers, which makes them
+# look like numbered headings.
+AFFILIATION_RE = re.compile(
+    r"\b(?:university|universität|université|institute|institution|department|faculty|school|"
+    r"college|laboratory|laboratories|centre|center|hospital|academy|correspondence)\b",
+    re.IGNORECASE,
+)
+CITATION_LIKE_RE = re.compile(r"et al\.|doi\s*:|@|\(\s*(?:19|20)\d{2}[a-z]?\s*\)", re.IGNORECASE)
+# Metadata box lines that journals print next to the abstract.
+ARTICLE_META_LINE_RE = re.compile(
+    r"^(?:received|received in revised form|revised|accepted|available online|published|"
+    r"article history|article info|contents lists available|journal homepage|homepage|"
+    r"e-?mail address|corresponding author|https?://|www\.)",
+    re.IGNORECASE,
+)
+ARTICLE_META_DATE_RE = re.compile(
+    r"^\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"\s+\d{4}$",
+    re.IGNORECASE,
+)
+# Letter-spaced labels ("A r t i c l e   i n f o") that must never become sections.
+ARTICLE_META_COMPACT_LABELS = {"articleinfo", "highlights", "graphicalabstract"}
 PAGE_TITLE_RE = re.compile(r"^.+\s+\d+\s+I\d+\s*[·.]\s*T\d+", re.IGNORECASE)
 VISUAL_TOKEN_RE = re.compile(r"\b(?:I|T|IN)\s*\d+\b|\bT\s*N\b|⋮|⋱|·")
 MODEL_DIAGRAM_RE = re.compile(
@@ -66,6 +310,9 @@ TABLE_DENSE_RE = re.compile(
 )
 PDF_EXTRACTOR = Literal["auto", "pymupdf", "pypdf"]
 TRANSLATION_STATUSES = {"translated", "skipped", "needs_ocr", "needs_formula_recovery"}
+# Bump when section splitting or the output schema changes so cached translations can be flagged
+# as stale instead of silently showing an older structure.
+GENERATOR_VERSION = "2026.09.1"
 MATH_TOKEN_RE = re.compile(r"@@MATH_[0-9]{4,}@@")
 REFERENCE_TOKEN_RE = re.compile(r"@@(?:XREF|CITE)_[0-9]{4,}@@")
 LITERAL_TOKEN_RE = re.compile(r"@@LITERAL_[0-9]{4,}@@")
@@ -112,6 +359,7 @@ class Paragraph:
     page: int
     anchor: str
     source: str
+    page_end: int = 0
     status: str = ""
     translation: str = ""
     note: str = ""
@@ -368,6 +616,135 @@ def is_dense_visual_block(text: str) -> bool:
     return False
 
 
+def is_short_line_stack(text: str) -> bool:
+    """Table columns and axis stacks extract as many short lines without prose."""
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    if len(lines) < 3:
+        return False
+    return all(
+        text_weight(line) <= 4 and len(line.split()) <= 3 and not re.search(r"[.!?。；;]\s*$", line)
+        for line in lines
+    )
+
+
+def merge_rects(
+    rects: list[tuple[float, float, float, float]],
+    gap: float = 6.0,
+) -> list[tuple[float, float, float, float]]:
+    """Merge touching or overlapping rectangles so drawings can be seen as one region."""
+    merged = [tuple(rect) for rect in rects]
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        result: list[tuple[float, float, float, float]] = []
+        for rect in merged:
+            for index, kept in enumerate(result):
+                if (
+                    rect[0] - gap <= kept[2]
+                    and kept[0] - gap <= rect[2]
+                    and rect[1] - gap <= kept[3]
+                    and kept[1] - gap <= rect[3]
+                ):
+                    result[index] = (
+                        min(kept[0], rect[0]),
+                        min(kept[1], rect[1]),
+                        max(kept[2], rect[2]),
+                        max(kept[3], rect[3]),
+                    )
+                    changed = True
+                    break
+            else:
+                result.append(rect)
+        merged = result
+    return merged
+
+
+def page_visual_regions(page: Any) -> list[tuple[float, float, float, float]]:
+    """Figure and table areas: their text is decoration (axis labels, cells), not prose."""
+    page_rect = (0.0, 0.0, float(page.rect.width), float(page.rect.height))
+    page_area = rect_area(page_rect) or 1.0
+    regions: list[tuple[float, float, float, float]] = []
+
+    try:
+        for table in page.find_tables().tables:
+            regions.append(tuple(float(value) for value in table.bbox))
+    except Exception:  # noqa: BLE001 - table detection is optional.
+        pass
+
+    try:
+        drawings = [tuple(float(value) for value in item["rect"]) for item in page.get_drawings()]
+        for rect in merge_rects(drawings):
+            if rect_area(rect) >= page_area * 0.04 and rect[3] - rect[1] >= 30:
+                regions.append(rect)
+    except Exception:  # noqa: BLE001 - drawings are optional.
+        pass
+
+    try:
+        for info in page.get_image_info():
+            regions.append(tuple(float(value) for value in info.get("bbox", page_rect)))
+    except Exception:  # noqa: BLE001 - image geometry is optional.
+        pass
+
+    return regions
+
+
+def block_inside_regions(
+    bbox: tuple[float, float, float, float],
+    regions: list[tuple[float, float, float, float]],
+    threshold: float = 0.6,
+) -> bool:
+    return any(rect_overlap_ratio(bbox, region) >= threshold for region in regions)
+
+
+def widest_whitespace_gap(
+    intervals: list[tuple[float, float]],
+    minimum: float,
+) -> tuple[float, float, float] | None:
+    """Widest gap that no block crosses: a candidate column gutter or band separator."""
+    if not intervals:
+        return None
+    spans = sorted(intervals)
+    best: tuple[float, float, float] | None = None
+    end = spans[0][1]
+    for start, stop in spans[1:]:
+        gap = start - end
+        if gap >= minimum and (best is None or gap > best[0]):
+            best = (gap, end, start)
+        end = max(end, stop)
+    return best
+
+
+def order_blocks_reading_order(blocks: list[Any], depth: int = 0) -> list[Any]:
+    """XY-cut reading order: full-width bands first, then columns left to right."""
+    if depth >= 6 or len(blocks) <= 1:
+        return list(blocks)
+
+    x_intervals = [(block.bbox[0], block.bbox[2]) for block in blocks]
+    y_intervals = [(block.bbox[1], block.bbox[3]) for block in blocks]
+    width = max(x1 for _x0, x1 in x_intervals) - min(x0 for x0, _x1 in x_intervals)
+    height = max(y1 for _y0, y1 in y_intervals) - min(y0 for y0, _y1 in y_intervals)
+    vertical = widest_whitespace_gap(x_intervals, max(9.0, width * 0.02)) if width else None
+    horizontal = widest_whitespace_gap(y_intervals, max(6.0, height * 0.012)) if height else None
+    vertical_score = (vertical[0] / width) if vertical and width else 0.0
+    horizontal_score = (horizontal[0] / height) if horizontal and height else 0.0
+
+    if vertical and vertical_score >= 0.025 and vertical_score >= horizontal_score * 0.7:
+        middle = (vertical[1] + vertical[2]) / 2
+        first = [block for block in blocks if (block.bbox[0] + block.bbox[2]) / 2 <= middle]
+        second = [block for block in blocks if (block.bbox[0] + block.bbox[2]) / 2 > middle]
+        if first and second:
+            return order_blocks_reading_order(first, depth + 1) + order_blocks_reading_order(second, depth + 1)
+
+    if horizontal:
+        middle = (horizontal[1] + horizontal[2]) / 2
+        first = [block for block in blocks if (block.bbox[1] + block.bbox[3]) / 2 <= middle]
+        second = [block for block in blocks if (block.bbox[1] + block.bbox[3]) / 2 > middle]
+        if first and second:
+            return order_blocks_reading_order(first, depth + 1) + order_blocks_reading_order(second, depth + 1)
+
+    return sorted(blocks, key=lambda block: (round(block.bbox[1], 1), block.bbox[0]))
+
+
 def extract_pdf_pages_pymupdf(path: Path, page_range: str | None) -> list[tuple[int, str]]:
     try:
         import fitz  # type: ignore[import-not-found]
@@ -384,29 +761,15 @@ def extract_pdf_pages_pymupdf(path: Path, page_range: str | None) -> list[tuple[
             continue
 
         page = document[index]
-        payload = page.get_text("dict", sort=True)
-        image_rects: list[tuple[float, float, float, float]] = []
-        text_blocks: list[tuple[tuple[float, float, float, float], str]] = []
-
-        for block in payload.get("blocks", []):
-            bbox = tuple(float(value) for value in block.get("bbox", (0, 0, 0, 0)))
-            if block.get("type") == 1:
-                image_rects.append(bbox)
-                continue
-            if block.get("type") != 0:
-                continue
-
-            text = fitz_block_text(block)
-            if not text:
-                continue
-            if any(rect_overlap_ratio(bbox, image_rect) > 0.35 for image_rect in image_rects):
-                continue
-            if is_dense_visual_block(text):
-                continue
-
-            text_blocks.append((bbox, text))
-
-        page_text = "\n\n".join(text for _, text in text_blocks)
+        records = page_block_records(page)
+        kept = [
+            record
+            for record in records
+            if not is_dense_visual_block(record.text)
+            and not is_short_line_stack(record.text)
+            and not (record.visual and text_weight(record.text) <= 20 and not CAPTION_RE.match(record.text))
+        ]
+        page_text = "\n\n".join(record.text for record in order_blocks_reading_order(kept))
         pages.append((page_number, page_text))
 
     document.close()
@@ -433,6 +796,265 @@ def extract_pdf_pages(path: Path, page_range: str | None, extractor: PDF_EXTRACT
     return min(candidates, key=lambda item: item[0])[1]
 
 
+@dataclass
+class PdfTextBlock:
+    text: str
+    size: float
+    bold_ratio: float
+    line_count: int
+    in_margin: bool
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    visual: bool = False
+
+
+def is_bold_span(span: dict[str, Any]) -> bool:
+    if int(span.get("flags") or 0) & (1 << 4):
+        return True
+    return bool(re.search(r"(bold|black|heavy|semibold|demi)", str(span.get("font") or ""), re.IGNORECASE))
+
+
+def page_block_records(page: Any) -> list[PdfTextBlock]:
+    """Text blocks of one page with typography, geometry, and figure/table flags."""
+    height = float(page.rect.height) or 1.0
+    regions = page_visual_regions(page)
+    records: list[PdfTextBlock] = []
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        text = fitz_block_text(block)
+        if not text:
+            continue
+        sizes: list[float] = []
+        bold_chars = 0
+        total_chars = 0
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                span_text = str(span.get("text") or "")
+                if not span_text.strip():
+                    continue
+                sizes.append(float(span.get("size") or 0.0))
+                total_chars += len(span_text)
+                if is_bold_span(span):
+                    bold_chars += len(span_text)
+        if not sizes:
+            continue
+        bbox = tuple(float(value) for value in block.get("bbox", (0.0, 0.0, 0.0, 0.0)))
+        records.append(
+            PdfTextBlock(
+                text=text,
+                size=max(sizes),
+                bold_ratio=(bold_chars / total_chars) if total_chars else 0.0,
+                line_count=len(block.get("lines") or []),
+                in_margin=bbox[1] <= height * 0.12 or bbox[3] >= height * 0.88,
+                bbox=bbox,
+                visual=block_inside_regions(bbox, regions),
+            )
+        )
+    return records
+
+
+def pdf_page_blocks(path: Path, page_range: str | None = None) -> list[tuple[int, list[PdfTextBlock]]]:
+    """Read per-block typography so journal layouts can be segmented without LaTeX."""
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except Exception:  # noqa: BLE001 - typography hints are optional.
+        return []
+
+    try:
+        document = fitz.open(str(path))
+    except Exception:  # noqa: BLE001 - unreadable PDFs simply get no hints.
+        return []
+
+    pages: list[tuple[int, list[PdfTextBlock]]] = []
+    try:
+        wanted_pages = parse_page_range(page_range, document.page_count)
+        for index in range(document.page_count):
+            page_number = index + 1
+            if wanted_pages is not None and page_number not in wanted_pages:
+                continue
+            records = order_blocks_reading_order(page_block_records(document[index]))
+            pages.append((page_number, records))
+    finally:
+        document.close()
+
+    return pages
+
+
+def heading_candidate_kind(record: PdfTextBlock, body_size: float, bold_reliable: bool) -> bool:
+    """Typography verdict for a single block: is it shaped like a section heading?"""
+    text = record.text
+    stripped = text.strip()
+    if not heading_text_allowed(stripped):
+        return False
+    named = is_section_heading(text)
+    enlarged = body_size > 0 and record.size >= body_size * 1.08
+    bold = bold_reliable and record.bold_ratio >= 0.6
+    decorated = enlarged or bold
+    if named:
+        return True
+
+    cjk_chars = cjk_char_count(text)
+    if cjk_chars >= 2 and cjk_chars / max(1, len(text)) >= 0.25:
+        # Chinese and Japanese headings are short, unpunctuated, and often merely bold.
+        return bool(
+            record.line_count <= 1
+            and text_weight(text) <= 24
+            and not CJK_SENTENCE_END_RE.search(text)
+            and not any(mark in text for mark in ("。", "；", "，", "、"))
+            and decorated
+        )
+
+    letters = len(re.findall(r"[A-Za-z\u4e00-\u9fff]", text))
+    words = len(text.split())
+    if bool(re.search(r"[.!?]\s*$", text)) and words >= 5:
+        return False
+    if record.line_count <= 1:
+        # Single words are only headings when they are known section names.
+        return letters >= 3 and 2 <= words <= 12 and decorated
+    # Wrapped headings must carry more text so figure fragments ("C\nCH 3") stay out.
+    return letters >= 8 and words <= 10 and decorated
+
+
+def line_looks_like_heading(line: str) -> bool:
+    text = line.strip()
+    if not text or len(text) > 60:
+        return False
+    if len(text.split()) > 6:
+        # Footnotes and table rows keep running long after a heading would stop.
+        return False
+    if not heading_text_allowed(text):
+        return False
+    if re.search(r"[.!?。]\s*$", text) and not SECTION_NAME_HEADING_RE.match(text):
+        return False
+    return is_section_heading(text)
+
+
+def heading_text_allowed(text: str) -> bool:
+    """Reject prose, affiliations, and reference lines that only look like headings."""
+    stripped = text.strip()
+    if not stripped:
+        return False
+    # "competing interests." / "the end of the discussion." are sentence fragments.
+    if stripped.endswith(".") and re.search(r"[a-z]{2,}\.$", stripped):
+        return False
+    if re.match(r"^\s*\d+\s", stripped) and AFFILIATION_RE.search(stripped):
+        return False
+    if CITATION_LIKE_RE.search(stripped):
+        return False
+    if PUBLICATION_HEADER_RE.search(stripped):
+        # "J. Widget Sci. 2024, 3, 100-112" is a running head, not a section.
+        return False
+    if cjk_char_count(stripped) == 0 and not re.search(r"[A-Z]", stripped):
+        # An all-lowercase line is running prose, not a journal heading.
+        return False
+    return True
+
+
+def pdf_structure_hints(
+    path: Path,
+    page_range: str | None = None,
+) -> tuple[dict[int, set[str]], set[str], set[str]]:
+    """Detect headings, running heads, and non-prose regions from PDF typography.
+
+    Returns ``(heading_hints, noise_hints, blocked_hints)``: normalized heading text per page,
+    normalized margin lines that repeat across pages (running heads, journal footers, DOIs),
+    and text that must never become a section (figure labels, table cells).
+    """
+    pages = pdf_page_blocks(path, page_range)
+    if not pages:
+        return {}, set(), set()
+
+    body_weights: Counter[float] = Counter()
+    margin_pages: dict[str, set[int]] = {}
+    blocked: set[str] = set()
+    bold_chars = 0
+    total_chars = 0
+
+    for page_number, records in pages:
+        for record in records:
+            rounded = round(record.size, 1)
+            total_chars += len(record.text)
+            bold_chars += int(len(record.text) * record.bold_ratio)
+            if record.visual:
+                blocked.add(normalize_heading_text(record.text))
+                for line in record.text.split("\n"):
+                    blocked.add(normalize_heading_text(line))
+            elif not record.in_margin:
+                body_weights[rounded] += len(record.text)
+            if record.in_margin and not record.visual:
+                # Running heads usually carry a page number, so compare with digits masked.
+                for line in record.text.split("\n"):
+                    margin_pages.setdefault(noise_match_key(line), set()).add(page_number)
+                margin_pages.setdefault(noise_match_key(record.text), set()).add(page_number)
+
+    # Some CJK fonts are flagged bold for every glyph, which makes boldness useless as a signal.
+    bold_reliable = bool(total_chars) and (bold_chars / total_chars) < 0.6
+    # Character-weighted mode of the prose blocks: figure labels, table cells, and the reference
+    # list are usually a different size than the running body text.
+    body_size = body_weights.most_common(1)[0][0] if body_weights else 0.0
+    page_count = len(pages)
+    threshold = 2 if page_count <= 4 else max(2, int(page_count * 0.35))
+    noise = {key for key, seen_pages in margin_pages.items() if len(seen_pages) >= threshold}
+
+    hints: dict[int, set[str]] = {}
+    for page_number, records in pages:
+        page_hints = hints.setdefault(page_number, set())
+        for record in records:
+            text = record.text
+            if record.visual:
+                continue
+            if record.in_margin and noise_match_key(text) in noise:
+                continue
+            if TEXT_FURNITURE_RE.search(text) or CAPTION_RE.match(text) or PUBLICATION_HEADER_RE.search(text):
+                continue
+            if is_visual_artifact(text):
+                continue
+            in_margin = record.in_margin
+            named = is_section_heading(text)
+            enlarged = body_size > 0 and record.size >= body_size * 1.08
+            accepted = False
+            if record.line_count <= 2 and len(text) <= 120:
+                candidate = heading_candidate_kind(record, body_size, bold_reliable)
+                if in_margin:
+                    # Running heads and corner labels sit in the margin; only real titles and
+                    # section names printed there (chapter openers) qualify.
+                    candidate = (named and len(text) <= 60) or (
+                        enlarged and 10 <= len(text) <= 60 and len(text.split()) <= 6
+                    )
+                if candidate:
+                    page_hints.add(normalize_heading_text(text))
+                    accepted = True
+            if accepted:
+                continue
+            # Merged blocks keep a heading next to its body ("Methods\nField sampling\nBody")
+            # or a marginal number next to its title ("1\nIntroduction").
+            lines = text.split("\n")
+            prose_like = any(text_weight(line) >= 6 or len(line) >= 40 for line in lines)
+            if not prose_like:
+                # A stack of short lines is a table column, not a heading followed by text.
+                blocked.add(normalize_heading_text(text))
+                for line in lines:
+                    key = normalize_heading_text(line)
+                    if key not in page_hints:
+                        blocked.add(key)
+                continue
+            for line in lines:
+                key = normalize_heading_text(line)
+                if key in blocked or key in noise:
+                    continue
+                if line_looks_like_heading(line):
+                    page_hints.add(key)
+            if in_margin:
+                # Headers, footnotes, and badges in the margin must never become sections, but
+                # their text stays in the body so nothing is lost.
+                blocked.add(normalize_heading_text(text))
+                for line in lines:
+                    key = normalize_heading_text(line)
+                    if key not in page_hints:
+                        blocked.add(key)
+
+    blocked |= noise
+    return hints, noise, blocked
 def low_quality_page_numbers(pages: list[tuple[int, str]]) -> set[int]:
     low_quality: set[int] = set()
     for page, text in pages:
@@ -1225,10 +1847,90 @@ def extract_latex_pages(path: Path) -> list[tuple[int, str]]:
     return [(page, restore_math_tokens(text, formulas)) for page, text in pages]
 
 
-def split_page_paragraphs(text: str) -> list[str]:
+def normalize_heading_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+CJK_SENTENCE_END_RE = re.compile(r"[。！？；;]\s*$")
+
+
+def cjk_char_count(text: str) -> int:
+    return len(CJK_RE.findall(text))
+
+
+def text_weight(text: str) -> int:
+    """How much text a block carries; CJK text has no spaces so characters are counted."""
+    spaced_words = len(text.split())
+    return max(spaced_words, cjk_char_count(text) + len(re.findall(r"[A-Za-z]{2,}", text)))
+
+
+def normalize_cjk_spacing(text: str) -> str:
+    """PDF text extraction scatters spaces around CJK glyphs, which hurts translation."""
+    text = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff])", "", text)
+    text = re.sub(r"\s+(?=[，。；：、？！）“”‘’（）《》])", "", text)
+    text = re.sub(r"(?<=[（“‘《])\s+", "", text)
+    return text
+
+
+def noise_match_key(text: str) -> str:
+    """Comparison key for page furniture; digits are masked so page numbers do not matter."""
+    return re.sub(r"\d+", "#", normalize_heading_text(text))
+
+
+def is_section_heading(line: str) -> bool:
+    """True when a standalone line looks like a section heading in any layout style."""
+    text = re.sub(r"\s+", " ", line).strip()
+    if not text or len(text) > 120:
+        return False
+    if not heading_text_allowed(text):
+        return False
+    if HEADING_RE.match(text):
+        return True
+    return bool(SECTION_NAME_HEADING_RE.match(text))
+
+
+def abstract_line_remainder(line: str) -> str | None:
+    """Return the inline abstract body when the line is an abstract heading, else None."""
+    text = line.strip()
+    if not text:
+        return None
+    match = ABSTRACT_HEADING_RE.match(text)
+    if match:
+        return match.group(1).strip()
+    compact = re.sub(r"\s+", "", text).casefold()
+    for label in ABSTRACT_LABELS:
+        compact_label = re.sub(r"\s+", "", label).casefold()
+        if compact.startswith(compact_label):
+            return re.sub(r"\s+", "", text[len(label) :]).lstrip(":：—–-. ")
+    return None
+
+
+def keywords_line_remainder(line: str) -> str | None:
+    text = line.strip()
+    if not text or len(text) > 200:
+        return None
+    match = KEYWORDS_LINE_RE.match(text)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def split_page_paragraphs(
+    text: str,
+    heading_hints: set[str] | None = None,
+) -> list[str]:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = re.sub(r"-\n(?=[a-z])", "", cleaned)
     paragraphs: list[str] = []
+    hints = heading_hints or set()
+
+    def is_heading_line(line: str) -> bool:
+        if len(line) > 120:
+            return False
+        if is_section_heading(line):
+            return True
+        return normalize_heading_text(line) in hints
 
     def append_text(lines: list[str]) -> None:
         if not lines:
@@ -1257,7 +1959,13 @@ def split_page_paragraphs(text: str) -> list[str]:
 
         buffer: list[str] = []
         for line in lines:
-            if HEADING_RE.match(line) and len(line) <= 120:
+            if is_heading_line(line):
+                if len(buffer) == 1 and BARE_SECTION_NUMBER_RE.match(buffer[0]):
+                    # ACL/IEEE style prints the section number in the margin, so it lands in its
+                    # own line right before the title.
+                    paragraphs.append(f"{buffer[0]} {line}")
+                    buffer = []
+                    continue
                 append_text(buffer)
                 paragraphs.append(line)
                 buffer = []
@@ -1265,7 +1973,29 @@ def split_page_paragraphs(text: str) -> list[str]:
             buffer.append(line)
         append_text(buffer)
 
-    return [paragraph for paragraph in paragraphs if len(paragraph) >= 12 or HEADING_RE.match(paragraph)]
+    return [
+        paragraph
+        for paragraph in paragraphs
+        # CJK sentences are short in characters, so weigh them instead of counting letters.
+        if len(paragraph) >= 12 or text_weight(paragraph) >= 6 or is_heading_line(paragraph)
+    ]
+
+
+def merge_numbered_heading_lines(lines: list[str]) -> list[str]:
+    """Join a margin section number with the title printed next to it ("1" + "Introduction")."""
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if BARE_SECTION_NUMBER_RE.match(line) and not is_section_heading(line):
+            follower = lines[index + 1] if index + 1 < len(lines) else ""
+            if follower and is_section_heading(follower):
+                merged.append(f"{line} {follower}")
+                index += 2
+                continue
+        merged.append(line)
+        index += 1
+    return merged
 
 
 def embedded_heading(line: str) -> str:
@@ -1273,7 +2003,7 @@ def embedded_heading(line: str) -> str:
     if not match:
         return ""
     heading = match.group(1).strip()
-    return heading if HEADING_RE.match(heading) else ""
+    return heading if is_section_heading(heading) else ""
 
 
 def is_visual_artifact(paragraph: str) -> bool:
@@ -1321,16 +2051,60 @@ def is_visual_artifact_line(line: str) -> bool:
     return False
 
 
-def clean_extracted_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]:
+def repeated_furniture_lines(pages: list[tuple[int, str]]) -> set[str]:
+    """Short lines repeated across pages that are page furniture rather than content."""
+    occurrences: dict[str, set[int]] = {}
+    samples: dict[str, str] = {}
+    for page, text in pages:
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            candidate = re.sub(r"\s+", " ", line).strip()
+            if not candidate or len(candidate) > 120:
+                continue
+            key = noise_match_key(candidate)
+            occurrences.setdefault(key, set()).add(page)
+            samples.setdefault(key, candidate)
+
+    if len(pages) <= 1:
+        return set()
+    threshold = 2 if len(pages) <= 4 else max(2, int(len(pages) * 0.35))
+    return {
+        key
+        for key, seen_pages in occurrences.items()
+        if len(seen_pages) >= threshold
+        and (
+            TEXT_FURNITURE_RE.search(samples[key])
+            or PUBLICATION_HEADER_RE.search(samples[key])
+            or PAGE_HEADER_RE.search(samples[key])
+        )
+    }
+
+
+def clean_extracted_pages(
+    pages: list[tuple[int, str]],
+    *,
+    noise_hints: set[str] | None = None,
+    heading_hints: dict[int, set[str]] | None = None,
+    recover_front_matter: bool = False,
+) -> list[tuple[int, str]]:
     cleaned_pages: list[tuple[int, str]] = []
     seen_abstract = False
-    skip_front_matter = True
+    skip_front_matter = not recover_front_matter
+    noise = {noise_match_key(line) for line in (noise_hints or set())}
+    noise |= repeated_furniture_lines(pages)
+    hints = heading_hints or {}
+    started_body = not recover_front_matter
+    first_page = pages[0][0] if pages else 0
 
     for page, text in pages:
-        lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        lines = [
+            normalize_cjk_spacing(line.strip())
+            for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        ]
+        lines = merge_numbered_heading_lines(lines)
         output: list[str] = []
         in_author_footnote = False
         caption_lines_remaining = 0
+        page_hints = hints.get(page, set())
 
         for line in lines:
             if not line:
@@ -1338,19 +2112,48 @@ def clean_extracted_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]
                 output.append("")
                 continue
 
-            abstract_match = ABSTRACT_LINE_RE.match(line)
-            if abstract_match:
+            if noise_match_key(line) in noise:
+                continue
+
+            abstract_text = abstract_line_remainder(line)
+            if abstract_text is not None:
                 seen_abstract = True
                 skip_front_matter = False
+                started_body = True
                 in_author_footnote = False
                 output.append("Abstract")
-                abstract_text = abstract_match.group(1).strip()
                 if abstract_text:
                     output.append(abstract_text)
                 continue
 
+            if not skip_front_matter:
+                keywords_text = keywords_line_remainder(line)
+                if keywords_text is not None:
+                    if keywords_text:
+                        output.append(keywords_text)
+                    continue
+
             if skip_front_matter and not seen_abstract:
                 continue
+
+            if (
+                ARTICLE_META_LINE_RE.match(line)
+                or ARTICLE_META_DATE_RE.match(line)
+                or re.sub(r"[\s.]+", "", line).casefold() in ARTICLE_META_COMPACT_LABELS
+            ):
+                continue
+
+            if not started_body:
+                # Journal PDFs without an "Abstract" heading: keep the body from the first real
+                # paragraph instead of dropping the whole document as front matter.
+                if page != first_page:
+                    started_body = True
+                elif len(line.split()) >= 20 and len(line) >= 120 and not is_section_heading(line):
+                    started_body = True
+                elif normalize_heading_text(line) in page_hints or is_section_heading(line):
+                    started_body = True
+                else:
+                    continue
 
             if FOOTNOTE_START_RE.match(line):
                 heading = embedded_heading(line)
@@ -1366,14 +2169,14 @@ def clean_extracted_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]
                 continue
 
             if caption_lines_remaining:
-                if HEADING_RE.match(line) and len(line) <= 120:
+                if is_section_heading(line):
                     caption_lines_remaining = 0
                 else:
                     caption_lines_remaining -= 1
                     continue
 
             if in_author_footnote:
-                if HEADING_RE.match(line) and not line.lower().startswith(("references", "acknowledg", "appendix")):
+                if is_section_heading(line) and not line.lower().startswith(("references", "acknowledg", "appendix")):
                     in_author_footnote = False
                 else:
                     continue
@@ -1387,6 +2190,13 @@ def clean_extracted_pages(pages: list[tuple[int, str]]) -> list[tuple[int, str]]
 
         cleaned_pages.append((page, "\n".join(output)))
 
+    if not recover_front_matter and pages and not any(text.strip() for _page, text in cleaned_pages):
+        return clean_extracted_pages(
+            pages,
+            noise_hints=noise_hints,
+            heading_hints=heading_hints,
+            recover_front_matter=True,
+        )
     return cleaned_pages
 
 
@@ -1401,40 +2211,128 @@ def new_section(title: str, page: int, existing_ids: set[str]) -> Section:
     return Section(id=section_id, title=title, page_start=page, page_end=page)
 
 
-def segment_document(pages: list[tuple[int, str]]) -> list[Section]:
-    pages = clean_extracted_pages(pages)
+def paragraph_continues_across_pages(previous: Paragraph, current: Paragraph) -> bool:
+    """True when a paragraph seems to run from the previous page into the current one."""
+    if current.page != previous.page + 1:
+        return False
+    previous_text = re.sub(r"\s+", " ", previous.source).strip()
+    current_text = re.sub(r"\s+", " ", current.source).strip()
+    if len(previous_text) < 200 or not current_text:
+        return False
+    if re.search(r"[.!?:;”’\"')\]]\s*$", previous_text):
+        return False
+    if not (current_text[0].islower() or current_text[0].isdigit() or current_text[0] in "(["):
+        return False
+    if re.match(r"^(?:figure|table|scheme|chart|eq\.?)\s*\d", current_text, re.IGNORECASE):
+        return False
+    return True
+
+
+def is_heading_paragraph(
+    paragraph: str,
+    hints: set[str],
+    compact_hints: set[str],
+    blocked_hints: set[str],
+) -> bool:
+    """Decide whether a paragraph starts a new section.
+
+    Typography hints win outright; text patterns are trusted unless the page markup shows the
+    line belongs to a figure, a table, or the running head.
+    """
+    key = normalize_heading_text(paragraph)
+    if key in blocked_hints:
+        return False
+    if key in hints or re.sub(r"\s+", "", key) in compact_hints:
+        return True
+    return is_section_heading(paragraph)
+
+
+def segment_document(
+    pages: list[tuple[int, str]],
+    *,
+    heading_hints: dict[int, set[str]] | None = None,
+    noise_hints: set[str] | None = None,
+    blocked_hints: set[str] | None = None,
+) -> list[Section]:
+    hints = heading_hints or {}
+    hints_available = bool(hints)
+    compact_by_page = {
+        page: {re.sub(r"\s+", "", key) for key in keys} for page, keys in hints.items()
+    }
+    blocked = set(blocked_hints or set())
+    pages = clean_extracted_pages(pages, noise_hints=noise_hints, heading_hints=hints)
+    noise_keys = {noise_match_key(line) for line in (noise_hints or set())}
     sections: list[Section] = []
     section_ids: set[str] = set()
     current = new_section("Front Matter", pages[0][0] if pages else 1, section_ids)
     sections.append(current)
 
     paragraph_counts: dict[str, int] = {}
+    previous: Paragraph | None = None
 
     for page, text in pages:
-        for paragraph in split_page_paragraphs(text):
+        page_hints = hints.get(page, set())
+        page_compact_hints = compact_by_page.get(page, set())
+        for paragraph in split_page_paragraphs(text, heading_hints=page_hints):
+            if len(paragraph) <= 160 and noise_match_key(paragraph) in noise_keys:
+                continue
             if is_visual_artifact(paragraph):
                 continue
-            if HEADING_RE.match(paragraph) and len(paragraph) <= 120:
-                if STOP_SECTION_RE.match(paragraph):
-                    return [section for section in sections if section.paragraphs]
+            key = normalize_heading_text(paragraph)
+            confirmed = key in page_hints or re.sub(r"\s+", "", key) in page_compact_hints
+            stop_candidate = bool(STOP_SECTION_RE.match(paragraph))
+            if stop_candidate and hints_available and not confirmed:
+                # A table column called "References" is not the reference section: without
+                # typographic confirmation the line stays plain body text.
+                paragraph_is_heading = False
+            else:
+                paragraph_is_heading = is_heading_paragraph(
+                    paragraph, page_hints, page_compact_hints, blocked
+                )
+            if paragraph_is_heading and hints_available and not confirmed:
+                # Typography exists but did not confirm this line: keep only short headings, so
+                # footnotes and list items ("1 While DQN works well on game environments…") stay
+                # in the body text.
+                stripped = paragraph.strip()
+                if SECTION_NAME_HEADING_RE.match(stripped):
+                    paragraph_is_heading = len(stripped.split()) <= 6
+                elif HEADING_RE.match(stripped):
+                    paragraph_is_heading = len(stripped.split()) <= 8
+            if paragraph_is_heading:
+                if stop_candidate:
+                    return finalize_sections(sections)
                 current = new_section(paragraph, page, section_ids)
                 sections.append(current)
+                previous = None
                 continue
 
             current.page_end = page
             count = paragraph_counts.get(current.id, 0) + 1
             paragraph_counts[current.id] = count
             paragraph_id = f"{current.id}-p{count}"
-            current.paragraphs.append(
-                Paragraph(
-                    id=paragraph_id,
-                    page=page,
-                    anchor=f"{current.title}, paragraph {count}",
-                    source=paragraph,
-                )
+            item = Paragraph(
+                id=paragraph_id,
+                page=page,
+                anchor=f"{current.title}, paragraph {count}",
+                source=paragraph,
+                page_end=page,
             )
+            if previous is not None and paragraph_continues_across_pages(previous, item):
+                previous.source = re.sub(r"\s+", " ", f"{previous.source} {item.source}").strip()
+                previous.page_end = page
+                continue
+            current.paragraphs.append(item)
+            previous = item
 
-    return [section for section in sections if section.paragraphs]
+    return finalize_sections(sections)
+
+
+def finalize_sections(sections: list[Section]) -> list[Section]:
+    kept = [section for section in sections if section.paragraphs]
+    if kept and kept[0].title == "Front Matter":
+        # No abstract heading in this PDF (Nature-style layout): label the opening block readably.
+        kept[0].title = "Main text"
+    return kept
 
 
 def associate_label_targets(sections: list[Section], bundle: ReferenceBundle) -> None:
@@ -1562,12 +2460,14 @@ def extraction_quality_summary(pages: list[tuple[int, str]]) -> dict[str, Any]:
         "paragraphs": len(paragraphs),
         "characters": sum(len(paragraph.source) for paragraph in paragraphs),
         "has_abstract": any(section.title.lower().startswith("abstract") for section in sections[:3]),
+        "has_headings": len(sections) >= 2,
     }
 
 
 def extraction_is_usable(summary: dict[str, Any]) -> bool:
     return bool(
-        summary["has_abstract"]
+        # Journals such as Nature print no abstract heading at all; a well split body is enough.
+        (summary["has_abstract"] or summary.get("has_headings"))
         and summary["paragraphs"] >= 8
         and summary["characters"] >= 1200
         and summary["score"] < 300
@@ -2316,6 +3216,7 @@ def build_output(
         "paperUrl": paper_url,
         "coverage": coverage,
         "source": source_note,
+        "generatorVersion": GENERATOR_VERSION,
         "extractionMethod": extraction_method,
         "contentFormat": "markdown+latex",
         "formulaCount": formula_count,
@@ -2333,6 +3234,7 @@ def build_output(
                     {
                         "id": paragraph.id,
                         "page": paragraph.page,
+                        **({"pageEnd": paragraph.page_end} if paragraph.page_end > paragraph.page else {}),
                         "anchor": restore_all_tokens(paragraph.anchor, formulas, references),
                         "sourceText": restore_all_tokens(paragraph.source, formulas, references),
                         "status": paragraph.status or "needs_ocr",
@@ -2397,6 +3299,7 @@ def generate_translation_json(
     formula_recovery_pages: set[int] = set()
     formulas: dict[str, str] = {}
     references = ReferenceBundle()
+    pdf_pages_used = False
 
     if text:
         extracted_pages = extract_text_pages(text)
@@ -2421,6 +3324,7 @@ def generate_translation_json(
     if not extracted_pages and pdf:
         formulas = {}
         extracted_pages, extraction_ocr_pages = extract_pdf_pages_adaptive(pdf, pages, pdf_extractor)
+        pdf_pages_used = True
         native_summary = extraction_quality_summary(extracted_pages)
         log_extraction_quality("pdf-native", native_summary)
         source_name = source_display_name(pdf)
@@ -2455,7 +3359,28 @@ def generate_translation_json(
             protected_pages.append((page, protected_text))
         extracted_pages = protected_pages
 
-    sections = segment_document(extracted_pages)
+    heading_hints: dict[int, set[str]] = {}
+    noise_hints: set[str] = set()
+    blocked_hints: set[str] = set()
+    if pdf_pages_used and pdf is not None:
+        try:
+            heading_hints, noise_hints, blocked_hints = pdf_structure_hints(pdf, pages)
+            print(
+                f"PDF layout hints: {sum(len(items) for items in heading_hints.values())} headings, "
+                f"{len(noise_hints)} running-head/footer lines, "
+                f"{len(blocked_hints)} figure/table text blocks.",
+                flush=True,
+            )
+        except Exception as error:  # noqa: BLE001 - hints are a best-effort improvement.
+            print(f"PDF layout hints unavailable: {error}", file=sys.stderr, flush=True)
+            heading_hints, noise_hints, blocked_hints = {}, set(), set()
+
+    sections = segment_document(
+        extracted_pages,
+        heading_hints=heading_hints,
+        noise_hints=noise_hints,
+        blocked_hints=blocked_hints,
+    )
     associate_label_targets(sections, references)
     if not sections:
         raise RuntimeError("No paragraphs were detected.")

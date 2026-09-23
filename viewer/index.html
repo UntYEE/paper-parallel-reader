@@ -41,6 +41,7 @@
           <select id="cached-paper-select" class="cached-paper-select" aria-label="已缓存论文" title="已缓存论文">
             <option value="">正在读取已缓存论文...</option>
           </select>
+          <button id="delete-cached-paper" class="quiet-button" type="button" title="删除该论文的本地 PDF、译文、资源与问答索引">删除缓存</button>
           <div id="paper-search-results" class="paper-search-results" hidden></div>
         </form>
         <iframe id="paper-frame" title="paper pdf"></iframe>
@@ -100,6 +101,10 @@
                 <input id="generate-force" type="checkbox" />
                 <span>强制重新生成</span>
               </label>
+            </div>
+            <div class="storage-row">
+              <span id="storage-usage" class="storage-usage">正在统计本地缓存…</span>
+              <button id="clear-search-cache" class="quiet-button" type="button" title="清空检索结果缓存，下次检索会重新联网">清空检索缓存</button>
             </div>
           </form>
         </details>

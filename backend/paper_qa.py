@@ -178,6 +178,26 @@ def index_translation(db_path: Path, paper_id: str, translation_path: Path) -> d
     return {"ready": bool(chunks), "cached": False, "chunks": len(chunks), "fingerprint": fingerprint}
 
 
+def delete_paper_index(db_path: Path, paper_id: str) -> dict[str, int]:
+    """Drop a paper from the QA index together with its stored chat history."""
+    if not db_path.exists():
+        return {"chunks": 0, "messages": 0}
+    with connect(db_path) as connection:
+        old_ids = [
+            row[0]
+            for row in connection.execute("SELECT id FROM qa_chunks WHERE paper_id = ?", (paper_id,))
+        ]
+        if old_ids:
+            connection.executemany(
+                "DELETE FROM qa_chunks_fts WHERE rowid = ?", [(row_id,) for row_id in old_ids]
+            )
+        chunks = connection.execute("DELETE FROM qa_chunks WHERE paper_id = ?", (paper_id,)).rowcount
+        connection.execute("DELETE FROM qa_documents WHERE paper_id = ?", (paper_id,))
+        messages = connection.execute("DELETE FROM qa_messages WHERE paper_id = ?", (paper_id,)).rowcount
+        connection.execute("DELETE FROM qa_sessions WHERE paper_id = ?", (paper_id,))
+    return {"chunks": int(chunks or 0), "messages": int(messages or 0)}
+
+
 def index_status(db_path: Path, paper_id: str, translation_path: Path | None = None) -> dict[str, Any]:
     with connect(db_path) as connection:
         row = connection.execute(

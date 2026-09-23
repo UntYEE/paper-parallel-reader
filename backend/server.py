@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import os
 import re
 import shutil
@@ -28,14 +29,21 @@ from pypdf import PdfReader
 from backend.paper_qa import (
     answer_question,
     clear_history,
+    delete_paper_index,
     get_history,
     index_status,
     index_translation,
 )
 from backend.paper_search import discover_papers
 from backend.local_security import DownloadTooLargeError, UnsafeRemoteURLError, download_remote_bytes
+from backend.search_cache import clear as clear_search_cache
+from backend.search_cache import stats as search_cache_stats
 from backend.task_store import get_task, mark_unfinished_tasks_interrupted, now_iso, save_task, update_task
-from scripts.generate_translation_json import create_deepseek_client, generate_translation_json
+from scripts.generate_translation_json import (
+    GENERATOR_VERSION,
+    create_deepseek_client,
+    generate_translation_json,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -74,8 +82,10 @@ DEFAULT_OUTPUT_DIR = DATA_ROOT / "translations"
 ASSET_DIR = DATA_ROOT / "paper-assets"
 MODEL_CACHE_DIR = configured_path("MODEL_CACHE_DIR", DATA_ROOT / "model-cache")
 INDEX_PATH = DATA_ROOT / "paper_index.json"
+INDEX_BACKUP_PATH = DATA_ROOT / "paper_index.json.bak"
 QA_DB_PATH = DATA_ROOT / "paper_qa.sqlite3"
 TASK_DB_PATH = DATA_ROOT / "generation_tasks.sqlite3"
+SEARCH_CACHE_PATH = DATA_ROOT / "search_cache.sqlite3"
 for directory in (DATA_ROOT, SOURCES_DIR, DEFAULT_OUTPUT_DIR, ASSET_DIR, MODEL_CACHE_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR / "huggingface"))
@@ -248,19 +258,33 @@ def is_pdf_file(path: Path) -> bool:
 
 
 def load_index() -> dict[str, object]:
-    if not INDEX_PATH.exists():
-        return {"papers": {}}
-    try:
-        data = json_loads(INDEX_PATH.read_text(encoding="utf-8"))
-    except ValueError:
-        return {"papers": {}}
-    if not isinstance(data.get("papers"), dict):
-        data["papers"] = {}
-    return data
+    for path in (INDEX_PATH, INDEX_BACKUP_PATH):
+        if not path.exists():
+            continue
+        try:
+            data = json_loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        if not isinstance(data.get("papers"), dict):
+            data["papers"] = {}
+        if path is INDEX_BACKUP_PATH:
+            # Self-heal: the primary index was unreadable, keep the recovered copy.
+            try:
+                atomic_write_bytes(INDEX_PATH, json_dumps(data).encode("utf-8"))
+            except OSError:
+                pass
+        return data
+    return {"papers": {}}
 
 
 def save_index(index: dict[str, object]) -> None:
-    INDEX_PATH.write_text(json_dumps(index), encoding="utf-8")
+    payload = json_dumps(index).encode("utf-8")
+    if INDEX_PATH.exists():
+        try:
+            shutil.copyfile(INDEX_PATH, INDEX_BACKUP_PATH)
+        except OSError:
+            pass
+    atomic_write_bytes(INDEX_PATH, payload)
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -387,6 +411,21 @@ def name_from_pdf_url(url: str) -> str:
     return safe_pdf_name(stem)
 
 
+def paper_filename_for_url(url: str) -> str:
+    """Avoid serving an unrelated cached PDF when two papers share a basename."""
+    filename = name_from_pdf_url(url)
+    path = paper_path(filename)
+    if not path.exists():
+        return filename
+    meta = read_paper_meta(path)
+    stored_source = (meta.get("sourceUrl") or "").strip()
+    if not stored_source or stored_source == url:
+        return filename
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+    stem = Path(filename).stem[:80] or "paper"
+    return safe_pdf_name(f"{stem}-{digest}.pdf")
+
+
 def paper_path(name: str) -> Path:
     filename = safe_pdf_name(name)
     path = (PAPERS_DIR / filename).resolve()
@@ -490,15 +529,33 @@ def paper_info(path: Path, source_url: str = "") -> dict[str, object]:
 
 
 def paper_payload(path: Path, source_url: str, *, cached: bool) -> dict[str, object]:
+    info = paper_info(path, source_url)
     return {
         "ok": True,
         "cached": cached,
-        **paper_info(path, source_url),
+        **info,
+        "structureStale": structure_is_stale(str(info.get("paperId") or "")),
     }
 
 
+def index_record(paper_id: str) -> dict[str, object]:
+    papers = load_index().get("papers", {})
+    record = papers.get(paper_id, {}) if isinstance(papers, dict) else {}
+    return record if isinstance(record, dict) else {}
+
+
+def structure_is_stale(paper_id: str) -> bool:
+    """True when the cached translation was produced by an older section splitter."""
+    if not paper_id:
+        return False
+    record = index_record(paper_id)
+    if not record.get("translationName"):
+        return False
+    return str(record.get("generatorVersion") or "") != GENERATOR_VERSION
+
+
 def missing_paper_payload(url: str) -> dict[str, object]:
-    filename = name_from_pdf_url(url)
+    filename = paper_filename_for_url(url)
     return {
         "ok": True,
         "cached": False,
@@ -632,9 +689,121 @@ def list_papers() -> dict[str, object]:
                 "translationUrl": (
                     translation_file_url(cached_translation) if cached_translation else ""
                 ),
+                "structureStale": bool(cached_translation) and structure_is_stale(paper_id),
             }
         )
     return {"ok": True, "papers": papers}
+
+
+def directory_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def data_path(value: str) -> Path | None:
+    """Resolve a stored relative path, refusing anything outside the data directories."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    for root in (DATA_ROOT.resolve(), REPO_ROOT.resolve()):
+        candidate = (root / value).resolve()
+        if candidate == root:
+            continue
+        if root in candidate.parents:
+            return candidate
+    return None
+
+
+@app.get("/api/storage")
+def storage_status() -> dict[str, object]:
+    pdf_bytes = 0
+    for item in DATA_ROOT.glob("*.pdf"):
+        try:
+            pdf_bytes += item.stat().st_size
+        except OSError:
+            continue
+    categories = {
+        "pdfs": pdf_bytes,
+        "translations": directory_size(DEFAULT_OUTPUT_DIR),
+        "latexSources": directory_size(SOURCES_DIR),
+        "assets": directory_size(ASSET_DIR),
+        "checkpoints": directory_size(DATA_ROOT / "checkpoints"),
+        "modelCache": directory_size(MODEL_CACHE_DIR),
+    }
+    papers = list(PAPERS_DIR.glob("*.pdf"))
+    ttl_hours = env_int("PAPER_SEARCH_CACHE_TTL_HOURS", 168)
+    return {
+        "ok": True,
+        "dataRoot": str(DATA_ROOT),
+        "totalBytes": directory_size(DATA_ROOT),
+        "categories": [{"name": name, "bytes": size} for name, size in categories.items()],
+        "paperCount": len(papers),
+        "searchCache": search_cache_stats(SEARCH_CACHE_PATH, ttl_hours),
+    }
+
+
+@app.post("/api/search-cache/clear")
+def clear_paper_search_cache() -> dict[str, object]:
+    return {"ok": True, "removed": clear_search_cache(SEARCH_CACHE_PATH)}
+
+
+@app.delete("/api/papers/{paper_id}")
+def delete_paper_cache(paper_id: str) -> JSONResponse:
+    record = index_record(paper_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="No cached paper is indexed under this id.")
+
+    removed: list[str] = []
+    freed = 0
+
+    def drop(path: Path | None) -> None:
+        nonlocal freed
+        if path is None or not path.exists() or not path.is_file():
+            return
+        try:
+            freed += path.stat().st_size
+            path.unlink()
+            removed.append(data_relative(path) if DATA_ROOT in path.parents else str(path))
+        except OSError as error:
+            print(f"Could not delete {path}: {error}", flush=True)
+
+    translation = indexed_translation_path(paper_id)
+    pdf_path = data_path(str(record.get("pdfPath") or ""))
+    if pdf_path is None and record.get("pdfName"):
+        candidate = paper_path(str(record["pdfName"]))
+        pdf_path = candidate if candidate.exists() else None
+    drop(pdf_path)
+    if pdf_path is not None:
+        drop(meta_path_for(pdf_path))
+    drop(translation)
+    drop(data_path(str(record.get("sourcePath") or "")))
+    translation_stem = Path(str(record.get("translationName") or "")).stem
+    if translation_stem:
+        assets_dir = (ASSET_DIR / translation_stem).resolve()
+        if ASSET_DIR.resolve() in assets_dir.parents and assets_dir.exists():
+            freed += directory_size(assets_dir)
+            shutil.rmtree(assets_dir, ignore_errors=True)
+            removed.append(data_relative(assets_dir))
+        for checkpoint in (DATA_ROOT / "checkpoints").glob(f"{translation_stem}-*.json"):
+            drop(checkpoint)
+
+    try:
+        delete_paper_index(QA_DB_PATH, paper_id)
+    except Exception as error:  # noqa: BLE001 - the files are already gone; report and continue.
+        print(f"QA cleanup failed for {paper_id}: {error}", flush=True)
+
+    papers = load_index().get("papers", {})
+    if isinstance(papers, dict):
+        papers.pop(paper_id, None)
+        save_index({"papers": papers})
+    return JSONResponse({"ok": True, "paperId": paper_id, "removed": removed, "freedBytes": freed})
 
 
 @app.post("/api/search-papers")
@@ -648,6 +817,7 @@ async def search_papers(request: PaperSearchRequest) -> JSONResponse:
         cached_records,
         request.limit,
         deepseek_api_key(),
+        cache_path=SEARCH_CACHE_PATH,
     )
     return JSONResponse({"ok": True, "query": request.query.strip(), **result})
 
@@ -684,7 +854,7 @@ async def upload_paper(
 
 @app.post("/api/check-paper-cache")
 def check_paper_cache(url: Annotated[str, Form()]) -> JSONResponse:
-    filename = name_from_pdf_url(url)
+    filename = paper_filename_for_url(url)
     path = paper_path(filename)
     if path.exists() and is_pdf_file(path):
         if not read_paper_meta(path).get("sourceUrl"):
@@ -732,7 +902,7 @@ def ensure_arxiv_latex_source(arxiv_id: str) -> Path:
 
 @app.post("/api/download-paper")
 def download_paper(url: Annotated[str, Form()]) -> JSONResponse:
-    filename = name_from_pdf_url(url)
+    filename = paper_filename_for_url(url)
     path = paper_path(filename)
     if path.exists() and is_pdf_file(path):
         if not read_paper_meta(path).get("sourceUrl"):
@@ -951,6 +1121,13 @@ async def generate(
         cached_path = indexed_translation_path(paper_id)
         if source_mode != "latex" and not force and not dry_run and cached_path:
             print(f"Cache hit for {paper_id}: {storage_label(cached_path)}", flush=True)
+            stale = structure_is_stale(paper_id)
+            if stale:
+                print(
+                    f"Cached translation for {paper_id} came from an older section splitter; "
+                    "it may show an outdated structure.",
+                    flush=True,
+                )
             return JSONResponse(
                 {
                     "ok": True,
@@ -964,6 +1141,8 @@ async def generate(
                     "viewer_url": f"/viewer/?pdf={local_pdf_url}&translation=./translations/{cached_path.name}",
                     "sections": 0,
                     "paragraphs": 0,
+                    "generatorVersion": GENERATOR_VERSION,
+                    "structureStale": stale,
                 }
             )
 
@@ -990,6 +1169,8 @@ async def generate(
                     "viewer_url": f"/viewer/?pdf={local_pdf_url}&translation=./translations/{output_path.name}",
                     "sections": 0,
                     "paragraphs": 0,
+                    "generatorVersion": GENERATOR_VERSION,
+                    "structureStale": structure_is_stale(paper_id),
                 }
             )
 
@@ -1068,6 +1249,7 @@ async def generate(
                 sourceMode=result.get("extractionMethod", "latex" if latex_path else "pdf"),
                 sections=len(result["sections"]),
                 paragraphs=paragraph_count,
+                generatorVersion=result.get("generatorVersion", GENERATOR_VERSION),
             )
             try:
                 await run_in_threadpool(index_translation, QA_DB_PATH, paper_id, output_path)
@@ -1088,6 +1270,8 @@ async def generate(
                 "paragraphs": paragraph_count,
                 "status_counts": status_counts,
                 "extraction_method": result.get("extractionMethod", ""),
+                "generatorVersion": result.get("generatorVersion", GENERATOR_VERSION),
+                "structureStale": False,
             }
         )
     finally:

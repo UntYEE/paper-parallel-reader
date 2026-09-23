@@ -53,6 +53,9 @@ const generateDryRunInput = document.querySelector("#generate-dry-run");
 const generateForceInput = document.querySelector("#generate-force");
 const generateButton = document.querySelector("#generate-button");
 const generateStatus = document.querySelector("#generate-status");
+const storageUsage = document.querySelector("#storage-usage");
+const clearSearchCacheButton = document.querySelector("#clear-search-cache");
+const deleteCachedPaperButton = document.querySelector("#delete-cached-paper");
 const chatToggle = document.querySelector("#chat-toggle");
 const chatDrawer = document.querySelector("#chat-drawer");
 const chatClose = document.querySelector("#chat-close");
@@ -147,6 +150,13 @@ function pageRange(section) {
   return "";
 }
 
+function paragraphPageLabel(paragraph) {
+  if (paragraph.page && paragraph.pageEnd && paragraph.pageEnd !== paragraph.page) {
+    return `p. ${paragraph.page}-${paragraph.pageEnd}`;
+  }
+  return paragraph.page ? `p. ${paragraph.page}` : "";
+}
+
 function normalizeSections(data) {
   if (Array.isArray(data?.sections)) {
     return data.sections.map((section, sectionIndex) => ({
@@ -158,6 +168,7 @@ function normalizeSections(data) {
         ? section.paragraphs.map((paragraph, paragraphIndex) => ({
             id: paragraph.id || `${section.id || `section-${sectionIndex + 1}`}-p${paragraphIndex + 1}`,
             page: paragraph.page || "",
+            pageEnd: paragraph.pageEnd || "",
             anchor: paragraph.anchor || "",
             sourceText: paragraph.sourceText || "",
             status: paragraph.status || (paragraph.translation ? "translated" : "needs_ocr"),
@@ -562,7 +573,7 @@ function renderTranslation(data, query = "") {
     section.paragraphs.forEach((paragraph, paragraphIndex) => {
       const paragraphNode = paragraphTemplate.content.cloneNode(true);
       paragraphNode.querySelector(".paragraph-index").textContent = `${sectionIndex + 1}.${paragraphIndex + 1}`;
-      paragraphNode.querySelector(".paragraph-page").textContent = paragraph.page ? `p. ${paragraph.page}` : "";
+      paragraphNode.querySelector(".paragraph-page").textContent = paragraphPageLabel(paragraph);
       paragraphNode.querySelector(".paragraph-anchor").textContent = paragraph.anchor;
       const paragraphElement = paragraphNode.querySelector(".paragraph");
       paragraphElement.id = paragraph.id;
@@ -628,7 +639,8 @@ async function refreshDownloadedPapers(selectedName = null) {
     papers.forEach((paper) => {
       const option = document.createElement("option");
       option.value = paper.name;
-      option.textContent = `${paper.title || paper.name} · ${paper.translationUrl ? "已有译文" : "仅 PDF"}`;
+      const state = paper.translationUrl ? "已有译文" : "仅 PDF";
+      option.textContent = `${paper.title || paper.name} · ${state}${paper.structureStale ? " · 结构可更新" : ""}`;
       option.dataset.sourceUrl = paper.sourceUrl || "";
       option.dataset.fileUrl = paper.fileUrl || "";
       option.dataset.pdfUrl = paper.pdfUrl || "";
@@ -645,11 +657,60 @@ async function refreshDownloadedPapers(selectedName = null) {
   }
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(0)} KB`;
+  return `${value} B`;
+}
+
+async function refreshStorageUsage() {
+  if (!storageUsage) return;
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/storage`, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const cache = data.searchCache || {};
+    storageUsage.textContent =
+      `本地缓存 ${formatBytes(data.totalBytes)} · 论文 ${data.paperCount} 篇 · ` +
+      `检索缓存 ${cache.entries || 0} 条（命中 ${cache.hits || 0}）`;
+  } catch {
+    storageUsage.textContent = "缓存统计不可用";
+  }
+}
+
+async function deleteCachedPaper() {
+  const paper = cachedPapers.find((item) => item.name === cachedPaperSelect.value);
+  if (!paper) {
+    setGenerateStatus("先在“已缓存论文”里选择一篇论文", "warn");
+    return;
+  }
+  const label = paper.title || paper.name;
+  if (!window.confirm(`删除《${label}》的本地缓存（PDF、译文、资源、问答索引与检查点）？`)) return;
+  deleteCachedPaperButton.disabled = true;
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/papers/${encodeURIComponent(paper.paperId)}`, {
+      method: "DELETE"
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    setGenerateStatus(`已删除缓存，释放 ${formatBytes(data.freedBytes)}`, "ok");
+    currentSavedPdfName = "";
+    await refreshDownloadedPapers("");
+    await refreshStorageUsage();
+  } catch (error) {
+    setGenerateStatus(`删除失败：${error.message}`, "warn");
+  } finally {
+    deleteCachedPaperButton.disabled = false;
+  }
+}
+
 async function openCachedPaper(name) {
   const paper = cachedPapers.find((item) => item.name === name);
   if (!paper) return;
-  const revision = ++cachedSelectionRevision;
-  hidePaperSearchResults();
+    const revision = ++cachedSelectionRevision;
+    hidePaperSearchResults();
   currentPaperFile = null;
   generatePdfInput.value = "";
   pdfFileInput.value = "";
@@ -659,10 +720,15 @@ async function openCachedPaper(name) {
   loadedChatPaperId = "";
   chatSend.disabled = true;
   chatMessages.replaceChildren();
-  applyPaperInfo(paper);
-  renderTranslation({ title: paper.title || paper.name, paperId: paper.paperId,
-    paperUrl: paper.sourceUrl, sections: [] });
-  translationUrlInput.value = "";
+    applyPaperInfo(paper);
+    renderTranslation({ title: paper.title || paper.name, paperId: paper.paperId,
+      paperUrl: paper.sourceUrl, sections: [] });
+    if (paper.structureStale) {
+      generateForceInput.checked = true;
+      const panel = generatorForm.closest("details");
+      if (panel) panel.open = true;
+    }
+    translationUrlInput.value = "";
   if (!paper.translationUrl) {
     translationList.querySelector(".empty").textContent = "这篇论文尚未生成译文";
     setGenerateStatus("已载入本地 PDF，尚未生成译文", "ok");
@@ -677,7 +743,12 @@ async function openCachedPaper(name) {
     if (revision !== cachedSelectionRevision) return;
     translationUrlInput.value = url;
     renderTranslation(data);
-    setGenerateStatus("已载入缓存论文及译文", "ok");
+    setGenerateStatus(
+      paper.structureStale
+        ? "已载入缓存译文：由旧版本生成，章节结构可能已过时，重新生成即可更新"
+        : "已载入缓存论文及译文",
+      paper.structureStale ? "warn" : "ok",
+    );
   } catch (error) {
     if (revision !== cachedSelectionRevision) return;
     setGenerateStatus(`PDF 已载入，缓存译文读取失败：${error.message}`, "warn");
@@ -960,6 +1031,7 @@ generatorForm.addEventListener("submit", async (event) => {
       setPaperUrl(generatedPdfUrl, paperUrl);
       await refreshDownloadedPapers(data.pdf_name || (pdfFile ? pdfFile.name : savedPdf));
     }
+    await refreshStorageUsage();
     loadTranslation(translationUrl);
   } catch (error) {
     setGenerateStatus(`Generate failed: ${error.message}`, "warn");
@@ -1012,6 +1084,23 @@ generateSavedPdfSelect.addEventListener("change", () => {
 });
 cachedPaperSelect.addEventListener("change", () => openCachedPaper(cachedPaperSelect.value));
 cachedPaperSelect.addEventListener("focus", () => refreshDownloadedPapers());
+deleteCachedPaperButton.addEventListener("click", () => {
+  deleteCachedPaper();
+});
+clearSearchCacheButton.addEventListener("click", async () => {
+  clearSearchCacheButton.disabled = true;
+  try {
+    const response = await fetch(`${BACKEND_URL}/api/search-cache/clear`, { method: "POST" });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok) throw new Error(data.detail || `HTTP ${response.status}`);
+    setGenerateStatus(`已清空 ${data.removed || 0} 条检索缓存`, "ok");
+    await refreshStorageUsage();
+  } catch (error) {
+    setGenerateStatus(`清空检索缓存失败：${error.message}`, "warn");
+  } finally {
+    clearSearchCacheButton.disabled = false;
+  }
+});
 
 searchBox.addEventListener("input", () => {
   renderTranslation(currentData, searchBox.value);
@@ -1109,3 +1198,4 @@ setPaperUrl(getParam("pdf", DEFAULT_PDF));
 loadTranslation(getParam("translation", DEFAULT_TRANSLATION));
 checkBackend();
 refreshDownloadedPapers();
+refreshStorageUsage();
