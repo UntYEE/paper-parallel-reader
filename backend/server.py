@@ -51,9 +51,15 @@ VIEWER_DIR = REPO_ROOT / "viewer"
 
 
 def load_env(path: Path) -> None:
-    if not path.exists():
+    try:
+        if not path.exists():
+            return
+        content = path.read_text(encoding="utf-8")
+    except OSError as error:
+        # Cloud-synced files can be temporarily unavailable; keep the current environment.
+        print(f"Could not read {path} ({error}); using the existing environment.", flush=True)
         return
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in content.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -126,9 +132,16 @@ def warn_if_env_permissions_are_broad(path: Path) -> None:
         print("Warning: .env is readable by other local users; consider running chmod 600 .env.", flush=True)
 
 
-migrate_legacy_data()
-warn_if_env_permissions_are_broad(ENV_PATH)
-mark_unfinished_tasks_interrupted(TASK_DB_PATH)
+for _startup_label, _startup_step in (
+    ("legacy data migration", lambda: migrate_legacy_data()),
+    ("env permission check", lambda: warn_if_env_permissions_are_broad(ENV_PATH)),
+    ("generation task recovery", lambda: mark_unfinished_tasks_interrupted(TASK_DB_PATH)),
+):
+    try:
+        _startup_step()
+    except OSError as error:
+        # A cloud-synced data directory may be unavailable for a moment; startup should continue.
+        print(f"Skipping {_startup_label}: {error}", flush=True)
 
 
 def configured_origins() -> list[str]:
