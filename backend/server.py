@@ -593,11 +593,17 @@ def write_paper_meta(path: Path, source_url: str, title: str = "") -> None:
 
 def read_paper_meta(path: Path) -> dict[str, str]:
     meta_path = meta_path_for(path)
-    if not meta_path.exists():
+    try:
+        exists = meta_path.exists()
+    except OSError:
+        return {}
+    if not exists:
         return {}
     try:
         return json_loads(meta_path.read_text(encoding="utf-8"))
-    except ValueError:
+    except (OSError, ValueError):
+        # Cloud-synced folders can fail or stall while a file is being materialised; a missing
+        # metadata file must not break the paper list.
         return {}
 
 

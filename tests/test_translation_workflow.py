@@ -559,6 +559,24 @@ See Figure \ref{fig:flow}, Table \ref{tab:prompt}, and Algorithm \ref{alg:run}.
         sections = segment_document(pages)
         self.assertEqual(["Abstract", "1 Introduction"], [section.title for section in sections])
 
+    def test_small_caps_headings_are_repaired(self) -> None:
+        """ICLR/ACL small caps extract as "I NTRODUCTION" and must still be recognised."""
+        pages = [
+            (
+                1,
+                "A BSTRACT\n\nWe study on-policy distillation of language models.\n\n"
+                "1 I NTRODUCTION\n\nDistillation transfers knowledge to a student model.\n\n"
+                "2 R ELATED W ORK\n\nPrior work studies imitation learning.\n\n"
+                "E XPERIMENTS\n\nWe evaluate on summarisation benchmarks.",
+            ),
+            (2, "R EFERENCES\n\n[1] Author, A. Title. Conference, 2024."),
+        ]
+        sections = segment_document(pages)
+        self.assertEqual(
+            ["Abstract", "1 INTRODUCTION", "2 RELATED WORK", "EXPERIMENTS"],
+            [section.title for section in sections],
+        )
+
     def test_figure_and_table_text_never_becomes_a_heading(self) -> None:
         pages = [
             (

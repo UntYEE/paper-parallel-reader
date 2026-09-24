@@ -60,6 +60,8 @@ JOURNAL_SECTION_NAMES = (
     "literature review",
     "theory",
     "theoretical background",
+    "preliminary",
+    "preliminaries",
     "materials and methods",
     "material and methods",
     "methods",
@@ -71,6 +73,8 @@ JOURNAL_SECTION_NAMES = (
     "experimental methods",
     "experimental details",
     "computational details",
+    "experiment",
+    "experiments",
     "results",
     "results and discussion",
     "results and conclusions",
@@ -1859,6 +1863,16 @@ def cjk_char_count(text: str) -> int:
     return len(CJK_RE.findall(text))
 
 
+def repair_letter_spacing(text: str) -> str:
+    """ICLR/ACL small caps extract as "I NTRODUCTION"; join the spread-out capital."""
+    return re.sub(r"(?<![A-Za-z])([A-Z])\s+(?=[A-Z]+)", r"\1", text)
+
+
+def heading_variants(text: str) -> tuple[str, ...]:
+    repaired = repair_letter_spacing(text)
+    return (text,) if repaired == text else (text, repaired)
+
+
 def text_weight(text: str) -> int:
     """How much text a block carries; CJK text has no spaces so characters are counted."""
     spaced_words = len(text.split())
@@ -1885,9 +1899,19 @@ def is_section_heading(line: str) -> bool:
         return False
     if not heading_text_allowed(text):
         return False
-    if HEADING_RE.match(text):
-        return True
-    return bool(SECTION_NAME_HEADING_RE.match(text))
+    return any(
+        HEADING_RE.match(variant) or SECTION_NAME_HEADING_RE.match(variant)
+        for variant in heading_variants(text)
+    )
+
+
+def heading_display_text(line: str) -> str:
+    """Prefer the letter-spacing repair when it is what makes the line a heading."""
+    text = re.sub(r"\s+", " ", line).strip()
+    variants = heading_variants(text)
+    if len(variants) == 1:
+        return text
+    return variants[1]
 
 
 def abstract_line_remainder(line: str) -> str | None:
@@ -2280,7 +2304,9 @@ def segment_document(
                 continue
             key = normalize_heading_text(paragraph)
             confirmed = key in page_hints or re.sub(r"\s+", "", key) in page_compact_hints
-            stop_candidate = bool(STOP_SECTION_RE.match(paragraph))
+            stop_candidate = any(
+                STOP_SECTION_RE.match(variant) for variant in heading_variants(paragraph.strip())
+            )
             if stop_candidate and hints_available and not confirmed:
                 # A table column called "References" is not the reference section: without
                 # typographic confirmation the line stays plain body text.
@@ -2301,7 +2327,7 @@ def segment_document(
             if paragraph_is_heading:
                 if stop_candidate:
                     return finalize_sections(sections)
-                current = new_section(paragraph, page, section_ids)
+                current = new_section(heading_display_text(paragraph), page, section_ids)
                 sections.append(current)
                 previous = None
                 continue
