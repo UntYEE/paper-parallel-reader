@@ -139,8 +139,8 @@ for _startup_label, _startup_step in (
 ):
     try:
         _startup_step()
-    except OSError as error:
-        # A cloud-synced data directory may be unavailable for a moment; startup should continue.
+    except Exception as error:  # noqa: BLE001 - a busy data directory must not block startup.
+        # Cloud-synced data files can be unavailable (ETIMEDOUT, SQLite "disk I/O error", ...).
         print(f"Skipping {_startup_label}: {error}", flush=True)
 
 
