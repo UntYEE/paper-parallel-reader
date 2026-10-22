@@ -12,6 +12,7 @@ from backend.local_security import (
     DownloadTooLargeError,
     UnsafeRemoteURLError,
     ValidatingRedirectHandler,
+    normalize_pdf_url,
     read_limited,
     validate_remote_url,
 )
@@ -36,6 +37,32 @@ class LocalSecurityTests(unittest.TestCase):
         self.assertEqual(
             "https://example.org/paper.pdf",
             validate_remote_url("https://example.org/paper.pdf", resolver_for("93.184.216.34")),
+        )
+
+    def test_arxiv_accepts_proxy_fake_ip_without_weakening_private_network_block(self) -> None:
+        self.assertEqual(
+            "https://arxiv.org/pdf/2304.12212",
+            validate_remote_url("https://arxiv.org/pdf/2304.12212", resolver_for("198.18.0.126")),
+        )
+        with self.assertRaises(UnsafeRemoteURLError):
+            validate_remote_url("https://example.org/paper.pdf", resolver_for("198.18.0.126"))
+        with self.assertRaises(UnsafeRemoteURLError):
+            validate_remote_url("https://arxiv.org/pdf/2304.12212", resolver_for("192.168.1.10"))
+        with self.assertRaises(UnsafeRemoteURLError):
+            validate_remote_url("http://arxiv.org/pdf/2304.12212", resolver_for("198.18.0.126"))
+
+    def test_arxiv_abstract_url_is_normalized_to_pdf(self) -> None:
+        self.assertEqual(
+            "https://arxiv.org/pdf/2304.12212",
+            normalize_pdf_url("https://arxiv.org/abs/2304.12212"),
+        )
+        self.assertEqual(
+            "https://arxiv.org/pdf/hep-th/9901001",
+            normalize_pdf_url("https://export.arxiv.org/abs/hep-th/9901001"),
+        )
+        self.assertEqual(
+            "https://example.org/abs/2304.12212",
+            normalize_pdf_url("https://example.org/abs/2304.12212"),
         )
 
     def test_redirect_target_is_revalidated(self) -> None:

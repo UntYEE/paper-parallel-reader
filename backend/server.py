@@ -35,7 +35,12 @@ from backend.paper_qa import (
     index_translation,
 )
 from backend.paper_search import discover_papers
-from backend.local_security import DownloadTooLargeError, UnsafeRemoteURLError, download_remote_bytes
+from backend.local_security import (
+    DownloadTooLargeError,
+    UnsafeRemoteURLError,
+    download_remote_bytes,
+    normalize_pdf_url,
+)
 from backend.search_cache import clear as clear_search_cache
 from backend.search_cache import stats as search_cache_stats
 from backend.task_store import get_task, mark_unfinished_tasks_interrupted, now_iso, save_task, update_task
@@ -873,6 +878,7 @@ async def upload_paper(
 
 @app.post("/api/check-paper-cache")
 def check_paper_cache(url: Annotated[str, Form()]) -> JSONResponse:
+    url = normalize_pdf_url(url)
     filename = paper_filename_for_url(url)
     path = paper_path(filename)
     if path.exists() and is_pdf_file(path):
@@ -921,6 +927,7 @@ def ensure_arxiv_latex_source(arxiv_id: str) -> Path:
 
 @app.post("/api/download-paper")
 def download_paper(url: Annotated[str, Form()]) -> JSONResponse:
+    url = normalize_pdf_url(url)
     filename = paper_filename_for_url(url)
     path = paper_path(filename)
     if path.exists() and is_pdf_file(path):

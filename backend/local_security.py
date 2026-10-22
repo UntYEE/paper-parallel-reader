@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 import time
 import urllib.error
@@ -20,6 +21,35 @@ class DownloadTooLargeError(ValueError):
 
 
 Resolver = Callable[..., list[tuple[object, ...]]]
+
+PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+FAKE_IP_TRUSTED_HOSTS = frozenset({"arxiv.org", "export.arxiv.org", "www.arxiv.org"})
+
+
+def is_allowed_remote_address(
+    hostname: str,
+    scheme: str,
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
+    if ip.is_global:
+        return True
+    # Clash-style enhanced DNS maps public hosts to RFC 2544 benchmark addresses and
+    # transparently proxies the eventual connection. Keep this exception deliberately
+    # narrow: HTTPS arXiv hosts only, never arbitrary domains or real private networks.
+    return scheme == "https" and hostname in FAKE_IP_TRUSTED_HOSTS and ip in PROXY_FAKE_IP_NETWORK
+
+
+def normalize_pdf_url(url: str) -> str:
+    """Turn arXiv landing-page links into their canonical PDF URLs."""
+    value = url.strip()
+    parsed = urlsplit(value)
+    hostname = (parsed.hostname or "").rstrip(".").lower()
+    path = parsed.path.rstrip("/")
+    if hostname in FAKE_IP_TRUSTED_HOSTS and "/abs/" in path:
+        arxiv_id = path.split("/abs/", 1)[-1]
+        if re.fullmatch(r"(?:\d{4}\.\d{4,5}|[A-Za-z.-]+/\d{7})(?:v\d+)?", arxiv_id):
+            return f"https://arxiv.org/pdf/{arxiv_id}"
+    return value
 
 
 def validate_remote_url(url: str, resolver: Resolver | None = None) -> str:
@@ -45,7 +75,7 @@ def validate_remote_url(url: str, resolver: Resolver | None = None) -> str:
             ip = ipaddress.ip_address(raw_ip)
         except ValueError as error:
             raise UnsafeRemoteURLError("Remote host resolved to an invalid address.") from error
-        if not ip.is_global:
+        if not is_allowed_remote_address(hostname, parsed.scheme, ip):
             raise UnsafeRemoteURLError("Remote host resolves to a private or reserved address.")
     return parsed.geturl()
 
